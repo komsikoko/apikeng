@@ -18,12 +18,13 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional
 
-# Set default environment variables in code before reading them
-os.environ.setdefault("PANEL_TOKEN", "KENG")
-os.environ.setdefault("DATA_DIR", "/data" if os.path.isdir("/data") else "./data")
-os.environ.setdefault("SOCKET_POOL", "1")
-os.environ.setdefault("UVICORN_BACKLOG", "2048")
-os.environ.setdefault("UVICORN_LIMIT_CONCURRENCY", "256")
+# Embedded environment configuration (no external env vars required)
+os.environ["PANEL_TOKEN"] = "KENG"
+os.environ["DATA_DIR"] = "/data" if os.path.isdir("/data") else "./data"
+os.environ["SOCKET_POOL"] = "1"
+os.environ["WS_WORKER_RECYCLE_SEC"] = "3600"
+os.environ["UVICORN_BACKLOG"] = "2048"
+os.environ["UVICORN_LIMIT_CONCURRENCY"] = "256"
 
 import psutil
 import requests
@@ -43,17 +44,16 @@ except Exception:
 
 # ======================== CONFIG ========================
 
-PORT = int(os.environ.get("PORT", "8080"))
-PANEL_TOKEN = os.environ.get("PANEL_TOKEN", "").strip()
+PORT = 8080
+PANEL_TOKEN = "KENG"
 
-IG_APP_VERSION = os.environ.get("IG_APP_VERSION", "355.0.0.47.96").strip()
-IG_VERSION_CODE = os.environ.get("IG_VERSION_CODE", "656018442").strip()
-IG_USER_AGENT = os.environ.get(
-    "IG_USER_AGENT",
-    f"Instagram {IG_APP_VERSION} Android (34/14; 480dpi; 1080x2400; samsung; SM-S918B; dm3q; qcom; en_US; {IG_VERSION_CODE})",
-).strip()
+IG_APP_VERSION = "355.0.0.47.96"
+IG_VERSION_CODE = "656018442"
+IG_USER_AGENT = (
+    f"Instagram {IG_APP_VERSION} Android (34/14; 480dpi; 1080x2400; samsung; SM-S918B; dm3q; qcom; en_US; {IG_VERSION_CODE})"
+)
 
-DATA_DIR = os.environ.get("DATA_DIR", "/data" if os.path.isdir("/data") else "./data")
+DATA_DIR = os.environ["DATA_DIR"]
 os.makedirs(DATA_DIR, exist_ok=True)
 ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
 TEMPLATE_FILE = os.path.join(DATA_DIR, "template.json")
@@ -96,18 +96,12 @@ WS_ROTATE_MIN = 1800
 WS_ROTATE_MAX = 5400
 WS_HEALTH_CHECK_MIN = 300
 WS_HEALTH_CHECK_MAX = 600
-try:
-    WS_WORKER_RECYCLE_SEC = max(0, int(os.environ.get("WS_WORKER_RECYCLE_SEC", "3600")))
-except Exception:
-    WS_WORKER_RECYCLE_SEC = 3600
+WS_WORKER_RECYCLE_SEC = 3600
 
 MIN_SAFE_ADD_COOLDOWN = 20.0
 RENAME_PER_THREAD_GAP_SEC = 4.0
 
-try:
-    WS_SOCKET_POOL = max(1, min(10, int(os.environ.get("SOCKET_POOL", "1"))))
-except Exception:
-    WS_SOCKET_POOL = 1
+WS_SOCKET_POOL = 1
 
 _MWS_PARAMS = set()
 if IGRAPIWEB_AVAILABLE and make_ig_web_socket is not None:
@@ -3771,8 +3765,8 @@ async def health_check():
 
 
 if __name__ == "__main__":
-    backlog = int(os.environ.get("UVICORN_BACKLOG", "2048"))
-    limit_concurrency = int(os.environ.get("UVICORN_LIMIT_CONCURRENCY", "256"))
+    backlog = 2048
+    limit_concurrency = 256
     print(f"🌐 Web panel listening on 0.0.0.0:{PORT} (DATA_DIR={DATA_DIR}, SOCKET_POOL={WS_SOCKET_POOL}, WS_RECYCLE={WS_WORKER_RECYCLE_SEC}s)", flush=True)
     uvicorn.run(
         app,
