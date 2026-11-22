@@ -3,10 +3,13 @@
 
 import os
 import re
+import sys
 import json
 import time
 import uuid
+import signal
 import random
+import socket
 import hashlib
 import inspect
 import threading
@@ -19,6 +22,8 @@ from typing import Optional
 os.environ.setdefault("PANEL_TOKEN", "KENG")
 os.environ.setdefault("DATA_DIR", "/data" if os.path.isdir("/data") else "./data")
 os.environ.setdefault("SOCKET_POOL", "1")
+os.environ.setdefault("UVICORN_BACKLOG", "2048")
+os.environ.setdefault("UVICORN_LIMIT_CONCURRENCY", "256")
 
 import psutil
 import requests
@@ -38,7 +43,7 @@ except Exception:
 
 # ======================== CONFIG ========================
 
-PORT = int(os.environ.get("PORT", "8000"))
+PORT = int(os.environ.get("PORT", "8080"))
 PANEL_TOKEN = os.environ.get("PANEL_TOKEN", "").strip()
 
 IG_APP_VERSION = os.environ.get("IG_APP_VERSION", "355.0.0.47.96").strip()
@@ -85,10 +90,17 @@ WS_UA_POOL = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
 ]
 
+socket.setdefaulttimeout(8)
+
 WS_ROTATE_MIN = 1800
 WS_ROTATE_MAX = 5400
 WS_HEALTH_CHECK_MIN = 300
 WS_HEALTH_CHECK_MAX = 600
+try:
+    WS_WORKER_RECYCLE_SEC = max(0, int(os.environ.get("WS_WORKER_RECYCLE_SEC", "3600")))
+except Exception:
+    WS_WORKER_RECYCLE_SEC = 3600
+
 MIN_SAFE_ADD_COOLDOWN = 20.0
 RENAME_PER_THREAD_GAP_SEC = 4.0
 
@@ -118,6 +130,18 @@ store_lock = threading.Lock()
 GLOBAL_MESSAGES_SENT = 0
 BOT_START_TIME = datetime.now()
 
+_accounts_cache: Optional[dict] = None
+_template_cache: Optional[dict] = None
+
+
+def _handle_exit_signal(signum, frame):
+    print(f"[SYS] Received signal {signum}, exiting immediately...", flush=True)
+    os._exit(0)
+
+
+signal.signal(signal.SIGTERM, _handle_exit_signal)
+signal.signal(signal.SIGINT, _handle_exit_signal)
+
 
 # ======================== AUTH HELPER ========================
 
@@ -132,18 +156,26 @@ def verify_auth(x_panel_token: Optional[str] = None, token_query: Optional[str] 
 # ======================== PERSISTENCE ========================
 
 def load_saved_accounts() -> dict:
+    global _accounts_cache
+    if _accounts_cache is not None:
+        return dict(_accounts_cache)
     with store_lock:
+        if _accounts_cache is not None:
+            return dict(_accounts_cache)
         if not os.path.exists(ACCOUNTS_FILE):
+            _accounts_cache = {}
             return {}
         try:
             with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            return data if isinstance(data, dict) else {}
+            _accounts_cache = data if isinstance(data, dict) else {}
         except Exception:
-            return {}
+            _accounts_cache = {}
+        return dict(_accounts_cache)
 
 
 def register_saved_account(username: str, ig_user_id=None, auth_method: str = "password"):
+    global _accounts_cache
     with store_lock:
         accounts = {}
         if os.path.exists(ACCOUNTS_FILE):
@@ -164,9 +196,11 @@ def register_saved_account(username: str, ig_user_id=None, auth_method: str = "p
         }
         with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
             json.dump(accounts, f, indent=2)
+        _accounts_cache = dict(accounts)
 
 
 def delete_saved_account(username: str):
+    global _accounts_cache
     with store_lock:
         if os.path.exists(ACCOUNTS_FILE):
             try:
@@ -176,6 +210,7 @@ def delete_saved_account(username: str):
                     del accounts[username]
                     with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
                         json.dump(accounts, f, indent=2)
+                    _accounts_cache = dict(accounts)
             except Exception:
                 pass
         session_path = os.path.join(DATA_DIR, f"ig_{username}.json")
@@ -188,38 +223,42 @@ def delete_saved_account(username: str):
 
 
 def _read_template_payload() -> dict:
+    global _template_cache
+    if _template_cache is not None:
+        return dict(_template_cache)
     if os.path.exists(TEMPLATE_FILE):
         try:
             with open(TEMPLATE_FILE, "r", encoding="utf-8") as f:
                 payload = json.load(f)
             if isinstance(payload, dict):
+                _template_cache = dict(payload)
                 return payload
         except Exception:
             pass
+    _template_cache = {}
     return {}
 
 
 def get_active_single_line_template() -> str:
-    with store_lock:
-        payload = _read_template_payload()
-        tpl = payload.get("template")
-        if isinstance(tpl, str) and tpl.strip():
-            lines = [ln.strip() for ln in tpl.splitlines() if ln.strip()]
-            if lines:
-                return lines[0]
-        return DEFAULT_SINGLE_LINE_TEMPLATE
+    payload = _read_template_payload()
+    tpl = payload.get("template")
+    if isinstance(tpl, str) and tpl.strip():
+        lines = [ln.strip() for ln in tpl.splitlines() if ln.strip()]
+        if lines:
+            return lines[0]
+    return DEFAULT_SINGLE_LINE_TEMPLATE
 
 
 def get_active_group_title_template() -> str:
-    with store_lock:
-        payload = _read_template_payload()
-        gt = payload.get("group_title_template")
-        if isinstance(gt, str) and gt.strip():
-            return gt.strip()
-        return DEFAULT_GROUP_TITLE_TEMPLATE
+    payload = _read_template_payload()
+    gt = payload.get("group_title_template")
+    if isinstance(gt, str) and gt.strip():
+        return gt.strip()
+    return DEFAULT_GROUP_TITLE_TEMPLATE
 
 
 def set_active_template(tpl: str, group_title_template: Optional[str] = None):
+    global _template_cache
     lines = [ln.strip() for ln in tpl.splitlines() if ln.strip()]
     if not lines:
         raise ValueError("Template cannot be empty.")
@@ -231,31 +270,31 @@ def set_active_template(tpl: str, group_title_template: Optional[str] = None):
             if isinstance(group_title_template, str) and group_title_template.strip()
             else existing.get("group_title_template") or DEFAULT_GROUP_TITLE_TEMPLATE
         )
+        new_payload = {
+            "template": single_line,
+            "group_title_template": gt,
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
         with open(TEMPLATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "template": single_line,
-                    "group_title_template": gt,
-                    "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                },
-                f,
-                indent=2,
-            )
+            json.dump(new_payload, f, indent=2)
+        _template_cache = dict(new_payload)
 
 
 def reset_active_template():
+    global _template_cache
     with store_lock:
         if os.path.exists(TEMPLATE_FILE):
             try:
                 os.remove(TEMPLATE_FILE)
             except Exception:
                 pass
+        _template_cache = {}
 
 
 def save_ws_sessions_disk():
+    with ws_lock:
+        payload = {uid: dict(w.data) for uid, w in ws_sessions.items()}
     with store_lock:
-        with ws_lock:
-            payload = {uid: w.data for uid, w in ws_sessions.items()}
         try:
             with open(WS_SESSIONS_FILE, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2)
@@ -464,7 +503,7 @@ def fetch_threads_via_sessionid(session_id: str, ua: Optional[str] = None) -> li
         "https://i.instagram.com/api/v1/direct_v2/inbox/?persistentBadging=true&folder=&limit=30",
     ):
         try:
-            resp = requests.get(url, headers=headers, cookies=cookies, timeout=15)
+            resp = requests.get(url, headers=headers, cookies=cookies, timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
                 found = []
@@ -671,6 +710,20 @@ def clamp_socket_pool(n: int) -> int:
     return max(1, min(10, int(n)))
 
 
+def _apply_sock_timeout(ws_obj, sec: float = 8.0):
+    try:
+        for attr in ("sock", "_sock", "ws", "_ws", "socket", "_socket", "conn", "_conn"):
+            inner = getattr(ws_obj, attr, None)
+            if inner is not None:
+                if hasattr(inner, "settimeout"):
+                    inner.settimeout(sec)
+                sub = getattr(inner, "sock", None)
+                if sub is not None and hasattr(sub, "settimeout"):
+                    sub.settimeout(sec)
+    except Exception:
+        pass
+
+
 class WsSessionWorker:
     def __init__(self, data: dict):
         self.data = data
@@ -679,7 +732,10 @@ class WsSessionWorker:
         self.rename_thread = None
         self.rotate_thread = None
         self.health_thread = None
+        self.recycle_thread = None
         self.listen_threads = []
+        self._listen_lock = threading.Lock()
+        self._recycle_lock = threading.Lock()
         self._executor = None
         self.pool_size = clamp_socket_pool(self.data.get("socket_pool", WS_SOCKET_POOL))
         self.data["socket_pool"] = self.pool_size
@@ -703,6 +759,7 @@ class WsSessionWorker:
             "sent": 0,
             "failed": 0,
             "renames": 0,
+            "recycles": 0,
             "start_time": None,
             "status": "stopped",
             "last_error": None,
@@ -731,12 +788,14 @@ class WsSessionWorker:
             base["device_dict"] = self._device_id
         return base
 
-    def _connect(self, label: str, max_retries: int = 3, retry_delay: float = 2.0):
+    def _connect(self, label: str, max_retries: int = 2, retry_delay: float = 1.5):
         if not IGRAPIWEB_AVAILABLE or make_ig_web_socket is None:
             raise RuntimeError("igrapiweb is not installed in this environment.")
         err = None
         base_kwargs = self._make_factory_kwargs()
         for attempt in range(max_retries):
+            if self.stop_event.is_set():
+                raise RuntimeError("stopped")
             for mode in ("dgw", "iris"):
                 try:
                     try:
@@ -747,9 +806,12 @@ class WsSessionWorker:
                             user_agent=self.data["ua"],
                         )
                     s.connect(dm_receive=mode)
+                    _apply_sock_timeout(s, 8.0)
                     lt = threading.Thread(target=self._listen_loop, args=(s,), daemon=True)
                     lt.start()
-                    self.listen_threads.append(lt)
+                    with self._listen_lock:
+                        self.listen_threads = [t for t in self.listen_threads if t.is_alive()]
+                        self.listen_threads.append(lt)
                     return s
                 except Exception as exc:
                     err = exc
@@ -778,7 +840,7 @@ class WsSessionWorker:
         last_err = None
         for i in range(n):
             try:
-                s = self._connect(f"pool{i}", max_retries=2, retry_delay=2.0)
+                s = self._connect(f"pool{i}", max_retries=2, retry_delay=1.5)
                 with self._pool_lock:
                     if i < len(self.sockets):
                         with self.socket_locks[i]:
@@ -789,13 +851,14 @@ class WsSessionWorker:
             except Exception as exc:
                 last_err = str(exc)[:100]
             if i < n - 1:
-                time.sleep(1.0)
+                time.sleep(0.8)
         if ok == 0:
             raise RuntimeError(last_err or "no sockets connected")
         return ok
 
     def set_socket_pool_size(self, new_count: int) -> int:
         target = clamp_socket_pool(new_count)
+        extra_socks = []
         with self._pool_lock:
             self.data["socket_pool"] = target
             self.pool_size = target
@@ -810,12 +873,6 @@ class WsSessionWorker:
                 extra_socks = self.sockets[target:]
                 self.sockets = self.sockets[:target]
                 self.socket_locks = self.socket_locks[:target]
-                for s in extra_socks:
-                    if s:
-                        try:
-                            s.disconnect()
-                        except Exception:
-                            pass
             else:
                 add_n = target - current
                 self.sockets.extend([None] * add_n)
@@ -826,6 +883,12 @@ class WsSessionWorker:
                         args=(current, target),
                         daemon=True,
                     ).start()
+        for s in extra_socks:
+            if s:
+                try:
+                    s.disconnect()
+                except Exception:
+                    pass
         return target
 
     def _grow_pool_slots(self, start_idx: int, end_idx: int):
@@ -856,25 +919,17 @@ class WsSessionWorker:
         with self._stats_lock:
             if self.stats["status"] in ("live", "starting", "stopping"):
                 return False, "Already running or stopping"
+            self.stats["status"] = "starting"
+            self.stats["last_error"] = None
 
-        for old_t in (self.msg_thread, self.rename_thread, self.rotate_thread, self.health_thread):
+        for old_t in (self.msg_thread, self.rename_thread, self.rotate_thread, self.health_thread, self.recycle_thread):
             if old_t and old_t.is_alive():
-                old_t.join(timeout=5)
-                if old_t.is_alive():
-                    return False, "Previous worker thread still active. Retry shortly."
+                old_t.join(timeout=2)
 
-        for lt in list(self.listen_threads):
-            if lt.is_alive():
-                lt.join(timeout=5)
-                if lt.is_alive():
-                    return False, "Previous listener thread still active. Retry shortly."
-
-        with self._inflight_lock:
-            if self._inflight > 0:
-                return False, f"{self._inflight} in-flight send(s) still finishing."
+        with self._listen_lock:
+            self.listen_threads = [t for t in self.listen_threads if t.is_alive()]
 
         self.stop_event = threading.Event()
-        self.listen_threads = []
         self._rr_idx = 0
 
         try:
@@ -892,6 +947,7 @@ class WsSessionWorker:
                 "sent": 0,
                 "failed": 0,
                 "renames": 0,
+                "recycles": 0,
                 "last_error": None if ok == self.pool_size else f"only {ok}/{self.pool_size} sockets",
                 "session_status": None,
                 "session_error": None,
@@ -901,15 +957,16 @@ class WsSessionWorker:
         self.rename_thread = threading.Thread(target=self._rename_loop, daemon=True)
         self.rotate_thread = threading.Thread(target=self._ws_rotate_loop, daemon=True)
         self.health_thread = threading.Thread(target=self._health_check_loop, daemon=True)
+        self.recycle_thread = threading.Thread(target=self._ws_recycle_loop, daemon=True)
         self.msg_thread.start()
         self.rename_thread.start()
         self.rotate_thread.start()
         self.health_thread.start()
+        self.recycle_thread.start()
         return True, None
 
     def _msg_loop(self):
-        global GLOBAL_MESSAGES_SENT
-        self._executor = ThreadPoolExecutor(max_workers=16)
+        self._executor = ThreadPoolExecutor(max_workers=8)
         next_fire = time.monotonic()
 
         try:
@@ -920,7 +977,7 @@ class WsSessionWorker:
 
                 with self._pool_lock:
                     live = sum(1 for s in self.sockets if s is not None)
-                max_inflight = max(2, live * 4) if live > 0 else 1
+                max_inflight = max(4, min(8, live * 2)) if live > 0 else 1
 
                 now = time.monotonic()
                 max_debt = max(1.5, interval * 20)
@@ -991,13 +1048,14 @@ class WsSessionWorker:
                         break
                     i = (idx + offset) % len(self.sockets)
                     sock_lock = self.socket_locks[i]
+                if not sock_lock.acquire(timeout=2.0):
+                    continue
                 try:
-                    with sock_lock:
-                        with self._pool_lock:
-                            sock = self.sockets[i] if i < len(self.sockets) else None
-                        if sock is None:
-                            continue
-                        res = sock.send_message(self.data["thread_id"], {"text": msg})
+                    with self._pool_lock:
+                        sock = self.sockets[i] if i < len(self.sockets) else None
+                    if sock is None:
+                        continue
+                    res = sock.send_message(self.data["thread_id"], {"text": msg})
 
                     if self._is_ok(res):
                         with self._stats_lock:
@@ -1018,6 +1076,8 @@ class WsSessionWorker:
                             self.stats["failed"] += 1
                         return
                     continue
+                finally:
+                    sock_lock.release()
 
             with self._stats_lock:
                 self.stats["failed"] += 1
@@ -1026,11 +1086,18 @@ class WsSessionWorker:
                 self._inflight -= 1
 
     def _rotate_socket_at(self, idx: int):
+        old = None
         with self._pool_lock:
             if idx >= len(self.sockets):
                 return
             sock_lock = self.socket_locks[idx]
-            with sock_lock:
+            if sock_lock.acquire(timeout=2.0):
+                try:
+                    old = self.sockets[idx]
+                    self.sockets[idx] = None
+                finally:
+                    sock_lock.release()
+            else:
                 old = self.sockets[idx]
                 self.sockets[idx] = None
         if old:
@@ -1041,11 +1108,10 @@ class WsSessionWorker:
         backoff = 5
         while not self.stop_event.is_set():
             try:
-                new = self._connect(f"rot{idx}", max_retries=2, retry_delay=2.0)
+                new = self._connect(f"rot{idx}", max_retries=2, retry_delay=1.5)
                 with self._pool_lock:
                     if idx < len(self.sockets):
-                        with self.socket_locks[idx]:
-                            self.sockets[idx] = new
+                        self.sockets[idx] = new
                         return
                 try:
                     new.disconnect()
@@ -1154,6 +1220,77 @@ class WsSessionWorker:
                 if idx < len(tids) - 1 and self.stop_event.wait(RENAME_PER_THREAD_GAP_SEC):
                     break
 
+    def recycle(self) -> tuple[bool, Optional[str]]:
+        if not self._recycle_lock.acquire(blocking=False):
+            return False, "Recycle already in progress"
+        try:
+            if self.stop_event.is_set() or self.stats.get("status") != "live":
+                return False, "WS session is not live"
+
+            with self._pool_lock:
+                old_socks = list(self.sockets)
+                n = len(old_socks)
+                for i in range(n):
+                    self.sockets[i] = None
+
+            for s in old_socks:
+                if s:
+                    try:
+                        s.disconnect()
+                    except Exception:
+                        pass
+
+            with self._listen_lock:
+                self.listen_threads = [t for t in self.listen_threads if t.is_alive()]
+
+            ok = 0
+            last_err = None
+            for i in range(n):
+                if self.stop_event.is_set():
+                    break
+                try:
+                    new_s = self._connect(f"recycle{i}", max_retries=2, retry_delay=1.5)
+                    with self._pool_lock:
+                        if i < len(self.sockets):
+                            old_slot = self.sockets[i]
+                            self.sockets[i] = new_s
+                            if old_slot:
+                                try:
+                                    old_slot.disconnect()
+                                except Exception:
+                                    pass
+                            ok += 1
+                        else:
+                            new_s.disconnect()
+                except Exception as exc:
+                    last_err = str(exc)[:90]
+                if i < n - 1 and self.stop_event.wait(0.6):
+                    break
+
+            with self._stats_lock:
+                self.stats["recycles"] = int(self.stats.get("recycles", 0)) + 1
+                if ok == 0 and n > 0:
+                    self.stats["last_error"] = f"recycle failed: {last_err or 'no sockets'}"
+                elif ok < n:
+                    self.stats["last_error"] = f"recycle {ok}/{n} sockets ({last_err or ''})".strip()
+
+            if ok == 0 and n > 0:
+                return False, last_err or "No sockets reconnected during recycle"
+            print(f"[WS:{self.data.get('session_name', '?')}] WS recycle complete ({ok}/{n} sockets)", flush=True)
+            return True, None
+        finally:
+            self._recycle_lock.release()
+
+    def _ws_recycle_loop(self):
+        if WS_WORKER_RECYCLE_SEC <= 0:
+            return
+        while not self.stop_event.is_set():
+            if self.stop_event.wait(WS_WORKER_RECYCLE_SEC):
+                break
+            if self.stop_event.is_set() or self.stats.get("status") != "live":
+                continue
+            self.recycle()
+
     def stop(self):
         if self.stats.get("status") == "stopped":
             return
@@ -1173,29 +1310,34 @@ class WsSessionWorker:
                 except Exception:
                     pass
 
-        for t in (self.msg_thread, self.rename_thread, self.rotate_thread, self.health_thread):
+        for t in (self.msg_thread, self.rename_thread, self.rotate_thread, self.health_thread, self.recycle_thread):
             if t and t.is_alive():
-                t.join(timeout=3)
-        for lt in self.listen_threads:
-            if lt.is_alive():
-                lt.join(timeout=3)
-        self.listen_threads = []
-
-        for _ in range(50):
-            with self._inflight_lock:
-                if self._inflight == 0:
-                    break
-            time.sleep(0.1)
+                t.join(timeout=1.5)
+        with self._listen_lock:
+            self.listen_threads = [t for t in self.listen_threads if t.is_alive()]
 
         with self._stats_lock:
             self.stats["status"] = "stopped"
 
     def get_stats(self) -> dict:
-        with self._stats_lock:
+        if self._stats_lock.acquire(timeout=0.05):
+            try:
+                s = dict(self.stats)
+            finally:
+                self._stats_lock.release()
+        else:
             s = dict(self.stats)
-        with self._pool_lock:
-            live = sum(1 for x in self.sockets if x is not None) if self.sockets else 0
-            total = len(self.sockets) if self.sockets else self.pool_size
+
+        if self._pool_lock.acquire(timeout=0.05):
+            try:
+                live = sum(1 for x in self.sockets if x is not None) if self.sockets else 0
+                total = len(self.sockets) if self.sockets else self.pool_size
+            finally:
+                self._pool_lock.release()
+        else:
+            live = 0
+            total = self.pool_size
+
         s["uptime"] = int(time.time() - s["start_time"]) if (s.get("start_time") and s.get("status") == "live") else 0
         s["sockets_live"] = live
         s["sockets_total"] = total
@@ -1492,6 +1634,7 @@ def _send_and_rename_ws_gc(session_id: str, ua: str, tid_str: str, text_body: st
                     break
                 except Exception:
                     continue
+            _apply_sock_timeout(sock, 8.0)
             res = sock.send_message(str(tid_str), {"text": text_body})
             if isinstance(res, dict) and (res.get("ok") is True or "message_id" in str(res)):
                 sent_ok = True
@@ -1523,7 +1666,7 @@ def _send_and_rename_ws_gc(session_id: str, ua: str, tid_str: str, text_body: st
                 },
                 cookies={"sessionid": session_id},
                 data={"thread_ids": f"[{tid_str}]", "text": text_body},
-                timeout=15,
+                timeout=10,
             )
             if resp.status_code in (200, 201):
                 sent_ok = True
@@ -1753,10 +1896,7 @@ async def lifespan(app: FastAPI):
                 ws_sessions[uid] = WsSessionWorker(rec)
         to_start = [(uid, w) for uid, w in ws_sessions.items() if w.data.get("auto_start", False)]
     for uid, w in to_start:
-        try:
-            w.start()
-        except Exception as exc:
-            print(f"[WS] Auto-start failed for {uid}: {exc}", flush=True)
+        threading.Thread(target=w.start, daemon=True).start()
     yield
 
 
@@ -1766,86 +1906,101 @@ app = FastAPI(title="IG Web Controller", lifespan=lifespan)
 # ======================== API ROUTES ========================
 
 @app.get("/api/state")
-def api_state(x_panel_token: Optional[str] = Header(default=None), token: Optional[str] = None):
+async def api_state(x_panel_token: Optional[str] = Header(default=None), token: Optional[str] = None):
     verify_auth(x_panel_token, token)
     cpu = psutil.cpu_percent(interval=None)
     ram = psutil.virtual_memory()
     proc_mb = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
 
-    with tasks_lock:
-        tasks_view = [
-            {
-                "task_id": tid,
-                "username": info.get("username"),
-                "target_name": info.get("target_name"),
-                "thread_ids": [str(x) for x in info.get("thread_ids", [])],
-                "speed_mode": info.get("speed_mode", "slow"),
-                "use_nc": bool(info.get("use_nc", True)),
-                "running": info.get("running"),
-                "msg_count": info.get("msg_count", 0),
-                "last_event": info.get("last_event", ""),
-                "last_update": info.get("last_update", ""),
-            }
-            for tid, info in active_tasks.items()
-        ]
-        multi_gc_view = [
-            {
-                "job_id": jid,
-                "label": j.get("label", ""),
-                "target_name": j.get("target_name", ""),
-                "thread_ids": [str(x) for x in j.get("thread_ids", [])],
-                "speed_mode": j.get("speed_mode", "slow"),
-                "use_nc": bool(j.get("use_nc", True)),
-                "running": bool(j.get("running", False)),
-                "msg_count": j.get("msg_count", 0),
-                "rename_count": j.get("rename_count", 0),
-                "last_event": j.get("last_event", ""),
-                "last_update": j.get("last_update", ""),
-            }
-            for jid, j in multi_gc_jobs.items()
-        ]
-        creator_view = [
-            {
-                "job_id": jid,
-                "username": j.get("username"),
-                "count": j.get("count", 0),
-                "created_count": j.get("created_count", 0),
-                "created_ids": list(j.get("created_ids", [])),
-                "running": bool(j.get("running", False)),
-                "last_event": j.get("last_event", ""),
-                "last_update": j.get("last_update", ""),
-                "errors": list(j.get("errors", []))[-5:],
-            }
-            for jid, j in group_creator_jobs.items()
-        ]
-        running_count = (
-            sum(1 for t in active_tasks.values() if t.get("running"))
-            + sum(1 for j in multi_gc_jobs.values() if j.get("running"))
-        )
+    tasks_view = []
+    multi_gc_view = []
+    creator_view = []
+    running_count = 0
 
-    with ws_lock:
-        ws_view = []
-        ws_live_count = 0
-        for uid, w in ws_sessions.items():
-            st = w.get_stats()
-            if st.get("status") == "live":
-                ws_live_count += 1
-            ws_view.append({
-                "uid": uid,
-                "session_name": w.data.get("session_name", "Unnamed"),
-                "thread_id": w.data.get("thread_id", ""),
-                "thread_ids": w.data.get("thread_ids", [w.data.get("thread_id", "")]),
-                "gc_name_text": w.data.get("gc_name_text", ""),
-                "msg_text": w.data.get("msg_text", ""),
-                "socket_pool": w.pool_size,
-                "delay_min": w.data.get("delay_min", 0.1),
-                "delay_max": w.data.get("delay_max", 0.2),
-                "rename_min": w.data.get("rename_min", 5.0),
-                "rename_max": w.data.get("rename_max", 15.0),
-                "auto_start": bool(w.data.get("auto_start", False)),
-                "device_id": str(w.data.get("device_id", ""))[:12],
-                "stats": st,
-            })
+    if tasks_lock.acquire(timeout=0.05):
+        try:
+            tasks_view = [
+                {
+                    "task_id": tid,
+                    "username": info.get("username"),
+                    "target_name": info.get("target_name"),
+                    "thread_ids": [str(x) for x in info.get("thread_ids", [])],
+                    "speed_mode": info.get("speed_mode", "slow"),
+                    "use_nc": bool(info.get("use_nc", True)),
+                    "running": info.get("running"),
+                    "msg_count": info.get("msg_count", 0),
+                    "last_event": info.get("last_event", ""),
+                    "last_update": info.get("last_update", ""),
+                }
+                for tid, info in active_tasks.items()
+            ]
+            multi_gc_view = [
+                {
+                    "job_id": jid,
+                    "label": j.get("label", ""),
+                    "target_name": j.get("target_name", ""),
+                    "thread_ids": [str(x) for x in j.get("thread_ids", [])],
+                    "speed_mode": j.get("speed_mode", "slow"),
+                    "use_nc": bool(j.get("use_nc", True)),
+                    "running": bool(j.get("running", False)),
+                    "msg_count": j.get("msg_count", 0),
+                    "rename_count": j.get("rename_count", 0),
+                    "last_event": j.get("last_event", ""),
+                    "last_update": j.get("last_update", ""),
+                }
+                for jid, j in multi_gc_jobs.items()
+            ]
+            creator_view = [
+                {
+                    "job_id": jid,
+                    "username": j.get("username"),
+                    "count": j.get("count", 0),
+                    "created_count": j.get("created_count", 0),
+                    "created_ids": list(j.get("created_ids", [])),
+                    "running": bool(j.get("running", False)),
+                    "last_event": j.get("last_event", ""),
+                    "last_update": j.get("last_update", ""),
+                    "errors": list(j.get("errors", []))[-5:],
+                }
+                for jid, j in group_creator_jobs.items()
+            ]
+            running_count = (
+                sum(1 for t in active_tasks.values() if t.get("running"))
+                + sum(1 for j in multi_gc_jobs.values() if j.get("running"))
+            )
+        finally:
+            tasks_lock.release()
+
+    ws_view = []
+    ws_live_count = 0
+    if ws_lock.acquire(timeout=0.05):
+        try:
+            ws_items = list(ws_sessions.items())
+        finally:
+            ws_lock.release()
+    else:
+        ws_items = list(ws_sessions.items())
+
+    for uid, w in ws_items:
+        st = w.get_stats()
+        if st.get("status") == "live":
+            ws_live_count += 1
+        ws_view.append({
+            "uid": uid,
+            "session_name": w.data.get("session_name", "Unnamed"),
+            "thread_id": w.data.get("thread_id", ""),
+            "thread_ids": w.data.get("thread_ids", [w.data.get("thread_id", "")]),
+            "gc_name_text": w.data.get("gc_name_text", ""),
+            "msg_text": w.data.get("msg_text", ""),
+            "socket_pool": w.pool_size,
+            "delay_min": w.data.get("delay_min", 0.1),
+            "delay_max": w.data.get("delay_max", 0.2),
+            "rename_min": w.data.get("rename_min", 5.0),
+            "rename_max": w.data.get("rename_max", 15.0),
+            "auto_start": bool(w.data.get("auto_start", False)),
+            "device_id": str(w.data.get("device_id", ""))[:12],
+            "stats": st,
+        })
 
     return {
         "accounts": load_saved_accounts(),
@@ -1938,6 +2093,7 @@ def api_ws_add(
     dev_id = existing.data.get("device_id") if existing and existing.data.get("device_id") else uuid.uuid4().hex
     uid = uuid.uuid4().hex[:12]
 
+    should_start = bool(True if body.auto_start is None else body.auto_start)
     rec = {
         "_uid": uid,
         "session_name": sname,
@@ -1953,25 +2109,22 @@ def api_ws_add(
         "rename_max": float(body.rename_max),
         "ua": ua,
         "device_id": dev_id,
-        "auto_start": False,
+        "auto_start": should_start,
     }
 
     worker = WsSessionWorker(rec)
     with ws_lock:
         ws_sessions[uid] = worker
 
-    ok, err = True, None
-    if bool(True if body.auto_start is None else body.auto_start):
-        ok, err = worker.start()
-        if ok:
-            rec["auto_start"] = True
+    if should_start:
+        threading.Thread(target=worker.start, daemon=True).start()
 
     save_ws_sessions_disk()
     return {
         "ok": True,
         "uid": uid,
-        "started": ok,
-        "error": err,
+        "started": should_start,
+        "error": None,
         "stats": worker.get_stats(),
     }
 
@@ -1987,10 +2140,8 @@ def api_ws_start(
         w = ws_sessions.get(uid)
     if not w:
         raise HTTPException(status_code=404, detail="WS session not found.")
-    ok, err = w.start()
-    if not ok:
-        raise HTTPException(status_code=400, detail=err or "Failed to start WS session.")
     w.data["auto_start"] = True
+    threading.Thread(target=w.start, daemon=True).start()
     save_ws_sessions_disk()
     return {"ok": True, "uid": uid, "stats": w.get_stats()}
 
@@ -2006,9 +2157,26 @@ def api_ws_stop(
         w = ws_sessions.get(uid)
     if not w:
         raise HTTPException(status_code=404, detail="WS session not found.")
-    w.stop()
     w.data["auto_start"] = False
+    threading.Thread(target=w.stop, daemon=True).start()
     save_ws_sessions_disk()
+    return {"ok": True, "uid": uid, "stats": w.get_stats()}
+
+
+@app.post("/api/ws/sessions/{uid}/recycle")
+def api_ws_recycle(
+    uid: str,
+    x_panel_token: Optional[str] = Header(default=None),
+    token: Optional[str] = None,
+):
+    verify_auth(x_panel_token, token)
+    with ws_lock:
+        w = ws_sessions.get(uid)
+    if not w:
+        raise HTTPException(status_code=404, detail="WS session not found.")
+    if w.stats.get("status") != "live":
+        raise HTTPException(status_code=400, detail="WS session is not live.")
+    threading.Thread(target=w.recycle, daemon=True).start()
     return {"ok": True, "uid": uid, "stats": w.get_stats()}
 
 
@@ -2073,12 +2241,10 @@ def api_ws_delete(
 ):
     verify_auth(x_panel_token, token)
     with ws_lock:
-        w = ws_sessions.get(uid)
+        w = ws_sessions.pop(uid, None)
     if not w:
         raise HTTPException(status_code=404, detail="WS session not found.")
-    w.stop()
-    with ws_lock:
-        ws_sessions.pop(uid, None)
+    threading.Thread(target=w.stop, daemon=True).start()
     save_ws_sessions_disk()
     return {"ok": True, "deleted": uid}
 
@@ -2485,8 +2651,8 @@ def api_stop_all(x_panel_token: Optional[str] = Header(default=None), token: Opt
     with ws_lock:
         ws_workers = list(ws_sessions.values())
     for w in ws_workers:
-        w.stop()
         w.data["auto_start"] = False
+        threading.Thread(target=w.stop, daemon=True).start()
     save_ws_sessions_disk()
     return {"ok": True}
 
@@ -2838,7 +3004,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
     <div class="card">
       <h2>6. WebSocket Multi-Sender (igrapiweb)</h2>
-      <div class="muted" id="wsMetaBar">Separate WebSocket worker engine (socket pool, live socket scaling, dgw/iris fallback, rotation & health checks).</div>
+      <div class="muted" id="wsMetaBar">Separate WebSocket worker engine (socket pool, live socket scaling, dgw/iris fallback, rotation, auto-recycle & health checks).</div>
 
       <div class="grid-2" style="margin-top:10px;">
         <div>
@@ -2967,15 +3133,23 @@ HTML_PAGE = """<!DOCTYPE html>
       refreshState();
     }
 
-    async function api(path, method = "GET", body = null) {
+    async function api(path, method = "GET", body = null, timeoutMs = 15000) {
       const tok = localStorage.getItem(TOKEN_KEY) || "";
       const headers = { "Content-Type": "application/json" };
       if (tok) headers["X-Panel-Token"] = tok;
-      const res = await fetch(path, {
-        method,
-        headers,
-        body: body ? JSON.stringify(body) : null,
-      });
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+      let res;
+      try {
+        res = await fetch(path, {
+          method,
+          headers,
+          body: body ? JSON.stringify(body) : null,
+          signal: ctrl.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
       const data = await res.json().catch(() => ({}));
       if (!res.ok && res.status !== 202) {
         throw new Error(data.detail || `Request failed (${res.status})`);
@@ -3063,7 +3237,10 @@ HTML_PAGE = """<!DOCTYPE html>
       renderThreadPicker();
     }
 
+    let isRefreshing = false;
     async function refreshState() {
+      if (isRefreshing) return;
+      isRefreshing = true;
       try {
         const { data } = await api("/api/state");
         const s = data.stats;
@@ -3071,7 +3248,7 @@ HTML_PAGE = """<!DOCTYPE html>
           `CPU ${s.cpu_percent}% · RAM ${s.ram_percent}% (${s.ram_used_gb}/${s.ram_total_gb} GB) · RSS ${s.rss_mb} MB · Sent ${data.global_messages_sent} · Uptime ${data.uptime}`;
 
         document.getElementById("wsMetaBar").textContent =
-          `igrapiweb: ${data.igrapiweb_available ? "Available" : "Not Installed"} · Default Pool Size: ${data.ws_socket_pool} · Separate from GitHub sync`;
+          `igrapiweb: ${data.igrapiweb_available ? "Available" : "Not Installed"} · Default Pool Size: ${data.ws_socket_pool} · WS-only recycle active`;
 
         const accs = Object.keys(data.accounts || {});
         const wsList = data.ws_sessions || [];
@@ -3198,7 +3375,7 @@ HTML_PAGE = """<!DOCTYPE html>
                   <span class="badge speed-badge">🔌 ${st.sockets_live || 0}/${st.sockets_total || 0} (pool:${w.socket_pool || 1})</span>
                   ${st.session_status ? `<span class="badge nc-badge">🩺 ${escapeHtml(st.session_status)}</span>` : ""}
                 </div>
-                <div class="muted">Sent: ${st.sent || 0} · Fail: ${st.failed || 0} · Renames: ${st.renames || 0} · Delay: ${w.delay_min}-${w.delay_max}s · Ren: ${w.rename_min}-${w.rename_max}s</div>
+                <div class="muted">Sent: ${st.sent || 0} · Fail: ${st.failed || 0} · Renames: ${st.renames || 0} · Recycles: ${st.recycles || 0} · Delay: ${w.delay_min}-${w.delay_max}s · Ren: ${w.rename_min}-${w.rename_max}s</div>
                 ${st.last_error ? `<div class="tid-mono" style="color:#fca5a5; margin-top:2px;">Err: ${escapeHtml(st.last_error)}</div>` : ""}
                 <div class="row" style="margin-top:6px;">
                   <span class="muted">Live Sockets (1–10):</span>
@@ -3214,6 +3391,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 <button class="secondary" onclick="wsAdjust('${escapeHtml(w.uid)}', 0.1, 0)">Msg +0.1</button>
                 <button class="secondary" onclick="wsAdjust('${escapeHtml(w.uid)}', 0, -1)">Ren -1</button>
                 <button class="secondary" onclick="wsAdjust('${escapeHtml(w.uid)}', 0, 1)">Ren +1</button>
+                <button class="secondary" onclick="wsAction('${escapeHtml(w.uid)}', 'recycle')">Recycle</button>
                 <button class="secondary" onclick="wsDelete('${escapeHtml(w.uid)}')">Delete</button>
               </div>
             </div>`;
@@ -3229,7 +3407,9 @@ HTML_PAGE = """<!DOCTYPE html>
           gtEl.value = data.group_title_template || "{TARGET}";
         }
       } catch (e) {
-        document.getElementById("statsBar").textContent = e.message;
+        document.getElementById("statsBar").textContent = e && e.name === "AbortError" ? "State request timed out" : e.message;
+      } finally {
+        isRefreshing = false;
       }
     }
 
@@ -3353,7 +3533,7 @@ HTML_PAGE = """<!DOCTYPE html>
         const { data } = await api("/api/ws/sessions", "POST", payload);
         document.getElementById("wsSessionId").value = "";
         if (data.started) {
-          showToast(`WS session "${payload.session_name}" started`);
+          showToast(`WS session "${payload.session_name}" starting`);
         } else {
           showToast(`Saved as stopped: ${data.error || "check socket/session"}`, true);
         }
@@ -3585,6 +3765,21 @@ def index(request: Request):
     return HTMLResponse(content=HTML_PAGE)
 
 
+@app.get("/health")
+async def health_check():
+    return {"ok": True, "status": "live", "uptime": str(datetime.now() - BOT_START_TIME).split(".")[0]}
+
+
 if __name__ == "__main__":
-    print(f"🌐 Web panel listening on 0.0.0.0:{PORT} (DATA_DIR={DATA_DIR}, SOCKET_POOL={WS_SOCKET_POOL})", flush=True)
-    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
+    backlog = int(os.environ.get("UVICORN_BACKLOG", "2048"))
+    limit_concurrency = int(os.environ.get("UVICORN_LIMIT_CONCURRENCY", "256"))
+    print(f"🌐 Web panel listening on 0.0.0.0:{PORT} (DATA_DIR={DATA_DIR}, SOCKET_POOL={WS_SOCKET_POOL}, WS_RECYCLE={WS_WORKER_RECYCLE_SEC}s)", flush=True)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=PORT,
+        log_level="warning",
+        backlog=backlog,
+        limit_concurrency=limit_concurrency,
+        timeout_keep_alive=15,
+    )
