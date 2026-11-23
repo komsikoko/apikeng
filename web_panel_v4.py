@@ -13,6 +13,7 @@ import socket
 import hashlib
 import inspect
 import threading
+from collections import deque
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -59,13 +60,13 @@ ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
 TEMPLATE_FILE = os.path.join(DATA_DIR, "template.json")
 WS_SESSIONS_FILE = os.path.join(DATA_DIR, "ws_sessions.json")
 
-DEFAULT_SINGLE_LINE_TEMPLATE = "<{TARGET}> Kɪ Mᴀᴀ Mᴏᴛɪ !< Gᴀɴᴅ Wᴀʟɪ> Rᴀɴᴅ!> -🌒-"
-DEFAULT_GROUP_TITLE_TEMPLATE = "{TARGET}"
+DEFAULT_SINGLE_LINE_TEMPLATE = "<{TARGET}> Kɪ Mᴀᴀ Mᴏᴛɪ !< Gᴀɴᴅ Wᴀʟɪ> Rᴀɴᴅ!> <😎>"
+DEFAULT_GROUP_TITLE_TEMPLATE = "{TARGET} <⚡️>"
 LINE_GAPS_AFTER = [6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 1]
 
 EMOJI_POOL = [
-    "🌒", "⚡", "🌀", "🪷", "🌱", "😂", "🤣", "🥳",
-    "❄️", "☔", "🌈", "🔥", "💀", "🤡", "😈", "👻",
+    "😎", "🦊", "🐉", "🦅", "🦂", "🦈", "🐺", "🦁",
+    "☄️", "💥", "🗡️", "🛡️", "👑", "💎", "🎯", "🧨",
 ]
 
 SUBTLE_LINK_SLUGS = [
@@ -73,11 +74,11 @@ SUBTLE_LINK_SLUGS = [
 ]
 
 WS_EMOJI_POOL = [
-    "🪾", "🪺", "🪹", "🍃", "🍂", "🍁", "🍀", "☘️", "🌿", "🌾", "🌵", "🌴",
-    "🌳", "🌲", "🪴", "🌱", "⚘️", "🪻", "🌷", "🌼", "🌻", "🌺", "🥀", "🌹",
-    "🏵", "🪷", "🌸", "💮",
+    "😎", "🦁", "🐯", "🐺", "🦊", "🐉", "🦅", "🦉", "🦇", "🦈", "🐊", "🦂",
+    "🕷️", "🐍", "🦖", "☄️", "💥", "🔥", "🌪️", "🌊", "❄️", "💎", "👑", "🗡️",
+    "🛡️", "🎯", "🧨", "🚀",
 ]
-WS_GC_EMOJI = "🪼"
+WS_GC_EMOJI = "⚡️"
 WS_FOOTER = "\n\n\n\nScript by - ρ 𝕣 ꪜ 𝕣 अब्बू ☽"
 
 WS_UA_POOL = [
@@ -121,6 +122,8 @@ pending_2fa: dict = {}
 tasks_lock = threading.Lock()
 ws_lock = threading.Lock()
 store_lock = threading.Lock()
+logs_lock = threading.Lock()
+PANEL_LOGS = deque(maxlen=400)
 GLOBAL_MESSAGES_SENT = 0
 BOT_START_TIME = datetime.now()
 
@@ -128,8 +131,16 @@ _accounts_cache: Optional[dict] = None
 _template_cache: Optional[dict] = None
 
 
+def append_panel_log(source: str, message: str):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    entry = f"[{ts}] [{source}] {message}"
+    with logs_lock:
+        PANEL_LOGS.append(entry)
+    print(entry, flush=True)
+
+
 def _handle_exit_signal(signum, frame):
-    print(f"[SYS] Received signal {signum}, exiting immediately...", flush=True)
+    append_panel_log("SYS", f"Received signal {signum}, exiting immediately...")
     os._exit(0)
 
 
@@ -293,7 +304,7 @@ def save_ws_sessions_disk():
             with open(WS_SESSIONS_FILE, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2)
         except Exception as exc:
-            print(f"[WS] Disk save error: {exc}", flush=True)
+            append_panel_log("WS", f"Disk save error: {exc}")
 
 
 def load_ws_sessions_disk() -> dict:
@@ -311,11 +322,24 @@ def load_ws_sessions_disk() -> dict:
 def render_single_line_with_random_emoji(base_line: str, target_name: str) -> str:
     chosen_emoji = random.choice(EMOJI_POOL)
     rendered = base_line.replace("{TARGET}", target_name).replace("{EMOJI}", chosen_emoji)
+    if "<😎>" in rendered:
+        return rendered.replace("<😎>", f"<{chosen_emoji}>")
     if "-🌒-" in rendered:
-        return rendered.replace("-🌒-", f"-{chosen_emoji}-")
+        return rendered.replace("-🌒-", f"<{chosen_emoji}>")
+    if re.search(r"![^!\s]+!\s*$", rendered):
+        return re.sub(r"![^!\s]+!(\s*)$", f"<{chosen_emoji}>\\1", rendered)
+    if re.search(r"<[^<>\s]+>\s*$", rendered):
+        return re.sub(r"<[^<>\s]+>(\s*)$", f"<{chosen_emoji}>\\1", rendered)
     if re.search(r"-[^\s-]+-\s*$", rendered):
-        return re.sub(r"-[^\s-]+-(\s*)$", f"-{chosen_emoji}-\\1", rendered)
-    return f"{rendered} -{chosen_emoji}-"
+        return re.sub(r"-[^\s-]+-(\s*)$", f"<{chosen_emoji}>\\1", rendered)
+    return f"{rendered} <{chosen_emoji}>"
+
+
+def format_nc_title(base_title: str) -> str:
+    cleaned = re.sub(r"\s*(?:!+\s*[^\s!<>]+\s*!+|<\s*[^\s<>]+\s*>)\s*$", "", base_title.strip()).strip()
+    if not cleaned:
+        cleaned = base_title.strip() or "GC"
+    return f"{cleaned} <{WS_GC_EMOJI}>"[:75]
 
 
 def build_expanded_message(single_line_template: str, target_name: str) -> str:
@@ -765,12 +789,12 @@ class WsSessionWorker:
     def build_message(self) -> str:
         subtle_link = make_subtle_z_link()
         emoji = random.choice(WS_EMOJI_POOL)
-        line = f"{self.data['msg_text']} !! {emoji} !!"
+        line = f"{self.data['msg_text']} <{emoji}>"
         body = ("\n" * 5).join([line] * random.randint(12, 18))
         return f"{subtle_link}\n\n{body}{WS_FOOTER}"
 
     def build_gc_name(self) -> str:
-        return f"{self.data['gc_name_text']} !! {WS_GC_EMOJI} !!"[:75]
+        return format_nc_title(self.data["gc_name_text"])
 
     def _make_factory_kwargs(self) -> dict:
         base = {"sessionid": self.data["session_id"], "user_agent": self.data["ua"]}
@@ -810,7 +834,7 @@ class WsSessionWorker:
                 except Exception as exc:
                     err = exc
                     if "connack" in str(exc).lower():
-                        print(f"[WS:{self.data.get('session_name', '?')}] connack on {mode} ({label})", flush=True)
+                        append_panel_log(f"WS:{self.data.get('session_name', '?')}", f"connack on {mode} ({label})")
                         time.sleep(retry_delay)
                         continue
             if attempt < max_retries - 1:
@@ -821,7 +845,7 @@ class WsSessionWorker:
         try:
             sock.listen()
         except Exception as exc:
-            print(f"[WS:{self.data.get('session_name', '?')}] listen error: {str(exc)[:100]}", flush=True)
+            append_panel_log(f"WS:{self.data.get('session_name', '?')}", f"listen error: {str(exc)[:100]}")
 
     def _seed_pool(self) -> int:
         n = clamp_socket_pool(self.data.get("socket_pool", self.pool_size))
@@ -929,10 +953,12 @@ class WsSessionWorker:
         try:
             ok = self._seed_pool()
         except Exception as exc:
+            err_msg = str(exc)[:100]
             with self._stats_lock:
                 self.stats["status"] = "error"
-                self.stats["last_error"] = str(exc)[:100]
-            return False, str(exc)[:100]
+                self.stats["last_error"] = err_msg
+            append_panel_log(f"WS:{self.data.get('session_name', '?')}", f"Start failed: {err_msg}")
+            return False, err_msg
 
         with self._stats_lock:
             self.stats.update({
@@ -947,6 +973,7 @@ class WsSessionWorker:
                 "session_error": None,
             })
 
+        append_panel_log(f"WS:{self.data.get('session_name', '?')}", f"Live ({ok}/{self.pool_size} sockets)")
         self.msg_thread = threading.Thread(target=self._msg_loop, daemon=True)
         self.rename_thread = threading.Thread(target=self._rename_loop, daemon=True)
         self.rotate_thread = threading.Thread(target=self._ws_rotate_loop, daemon=True)
@@ -1270,7 +1297,7 @@ class WsSessionWorker:
 
             if ok == 0 and n > 0:
                 return False, last_err or "No sockets reconnected during recycle"
-            print(f"[WS:{self.data.get('session_name', '?')}] WS recycle complete ({ok}/{n} sockets)", flush=True)
+            append_panel_log(f"WS:{self.data.get('session_name', '?')}", f"WS recycle complete ({ok}/{n} sockets)")
             return True, None
         finally:
             self._recycle_lock.release()
@@ -1292,6 +1319,7 @@ class WsSessionWorker:
         with self._stats_lock:
             self.stats["status"] = "stopping"
         self._cleanup()
+        append_panel_log(f"WS:{self.data.get('session_name', '?')}", "Stopped")
 
     def _cleanup(self):
         with self._pool_lock:
@@ -1364,7 +1392,7 @@ def log_creator(job_id: str, msg: str, created_id: Optional[str] = None, err: Op
             job["created_count"] = len(job["created_ids"])
         if err:
             job["errors"].append(err)
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] GC_JOB {job_id}: {msg}", flush=True)
+    append_panel_log(f"GC_JOB {job_id}", msg)
 
 
 def group_creator_loop(job_id: str):
@@ -1463,7 +1491,7 @@ def log_task(task_id: str, msg: str):
             return
         task["last_event"] = msg
         task["last_update"] = datetime.now().strftime("%H:%M:%S")
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {task_id}: {msg}", flush=True)
+    append_panel_log(f"TASK {task_id}", msg)
 
 
 def next_delay(speed_mode: str) -> float:
@@ -1475,9 +1503,10 @@ def next_delay(speed_mode: str) -> float:
 
 def apply_group_names_once(task_id: str, cl: Client, thread_ids: list[str], target_name: str):
     title_tpl = get_active_group_title_template()
-    new_title = title_tpl.replace("{TARGET}", target_name).strip()[:75]
-    if not new_title:
+    raw_title = title_tpl.replace("{TARGET}", target_name).strip()
+    if not raw_title:
         return
+    new_title = format_nc_title(raw_title)
     for idx, tid_str in enumerate(thread_ids):
         if not is_task_running(task_id):
             break
@@ -1609,7 +1638,7 @@ def log_multi_gc(job_id: str, msg: str, sent_inc: int = 0, rename_inc: int = 0):
             job["rename_count"] += rename_inc
         job["last_event"] = msg
         job["last_update"] = datetime.now().strftime("%H:%M:%S")
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] MGC {job_id}: {msg}", flush=True)
+    append_panel_log(f"MGC {job_id}", msg)
 
 
 def _send_and_rename_ws_gc(session_id: str, ua: str, tid_str: str, text_body: str, nc_title: Optional[str]) -> tuple[bool, bool, str]:
@@ -1704,7 +1733,7 @@ def multi_gc_loop(job_id: str):
             if custom_text:
                 link = make_subtle_z_link()
                 emoji = random.choice(WS_EMOJI_POOL)
-                payload = f"{link}\n\n{custom_text} !! {emoji} !!{WS_FOOTER}"
+                payload = f"{link}\n\n{custom_text} <{emoji}>{WS_FOOTER}"
             else:
                 expanded = build_expanded_message(single_line_tpl, target_name)
                 link = make_subtle_z_link()
@@ -1713,7 +1742,8 @@ def multi_gc_loop(job_id: str):
             nc_title = None
             if use_nc:
                 base_nc = nc_text if nc_text else title_tpl
-                nc_title = base_nc.replace("{TARGET}", target_name).strip()[:75] or target_name[:75] or "GC"
+                raw_nc = base_nc.replace("{TARGET}", target_name).strip() or target_name.strip() or "GC"
+                nc_title = format_nc_title(raw_nc)
 
             sent_ok = False
             renamed_ok = False
@@ -1891,6 +1921,7 @@ async def lifespan(app: FastAPI):
         to_start = [(uid, w) for uid, w in ws_sessions.items() if w.data.get("auto_start", False)]
     for uid, w in to_start:
         threading.Thread(target=w.start, daemon=True).start()
+    append_panel_log("SYS", "Panel server initialized")
     yield
 
 
@@ -1996,6 +2027,9 @@ async def api_state(x_panel_token: Optional[str] = Header(default=None), token: 
             "stats": st,
         })
 
+    with logs_lock:
+        logs_snapshot = list(PANEL_LOGS)
+
     return {
         "accounts": load_saved_accounts(),
         "template": get_active_single_line_template(),
@@ -2005,6 +2039,7 @@ async def api_state(x_panel_token: Optional[str] = Header(default=None), token: 
         "multi_gc_jobs": multi_gc_view,
         "group_creator_jobs": creator_view,
         "ws_sessions": ws_view,
+        "logs": logs_snapshot,
         "igrapiweb_available": IGRAPIWEB_AVAILABLE,
         "ws_socket_pool": WS_SOCKET_POOL,
         "min_safe_add_cooldown": MIN_SAFE_ADD_COOLDOWN,
@@ -2019,6 +2054,14 @@ async def api_state(x_panel_token: Optional[str] = Header(default=None), token: 
             "running_tasks": running_count + ws_live_count,
         },
     }
+
+
+@app.delete("/api/logs")
+def api_clear_logs(x_panel_token: Optional[str] = Header(default=None), token: Optional[str] = None):
+    verify_auth(x_panel_token, token)
+    with logs_lock:
+        PANEL_LOGS.clear()
+    return {"ok": True}
 
 
 # ---------- WS Multi-Sender API Endpoints ----------
@@ -2114,6 +2157,7 @@ def api_ws_add(
         threading.Thread(target=worker.start, daemon=True).start()
 
     save_ws_sessions_disk()
+    append_panel_log("WS", f"Added session '{sname}' ({uid})")
     return {
         "ok": True,
         "uid": uid,
@@ -2240,6 +2284,7 @@ def api_ws_delete(
         raise HTTPException(status_code=404, detail="WS session not found.")
     threading.Thread(target=w.stop, daemon=True).start()
     save_ws_sessions_disk()
+    append_panel_log("WS", f"Deleted session {uid}")
     return {"ok": True, "deleted": uid}
 
 
@@ -2266,6 +2311,7 @@ def api_login_session(
             raise RuntimeError("Could not verify Instagram user ID.")
         uname = resolve_username(cl)
         save_session(cl, uname, "sessionid")
+        append_panel_log("AUTH", f"Session login success for @{uname}")
         return {"ok": True, "username": uname, "user_id": str(cl.user_id)}
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {str(exc)[:180]}")
@@ -2289,11 +2335,13 @@ def api_login_password(
             cl.login(uname, body.password, verification_code=body.two_factor_code.strip())
             pending_2fa.pop(uname, None)
             save_session(cl, uname, "password+2fa")
+            append_panel_log("AUTH", f"Password+2FA login success for @{uname}")
             return {"ok": True, "username": uname, "user_id": str(cl.user_id)}
 
         cl = make_ig_client()
         cl.login(uname, body.password)
         save_session(cl, uname, "password")
+        append_panel_log("AUTH", f"Password login success for @{uname}")
         return {"ok": True, "username": uname, "user_id": str(cl.user_id)}
     except TwoFactorRequired:
         if cl is not None:
@@ -2324,6 +2372,7 @@ def api_delete_account(
 ):
     verify_auth(x_panel_token, token)
     delete_saved_account(username)
+    append_panel_log("AUTH", f"Deleted saved account @{username}")
     return {"ok": True, "removed": username}
 
 
@@ -2462,6 +2511,7 @@ def api_add_user_to_group(
                     "target_label": resolved_label,
                     "status": "added",
                 })
+                append_panel_log("ADD_USER", f"Added {resolved_label} to thread {tid_str}")
                 break
             except Exception as exc:
                 last_err = str(exc)[:140]
@@ -2474,6 +2524,7 @@ def api_add_user_to_group(
                 "target_label": resolved_label,
                 "status": f"failed: {last_err}",
             })
+            append_panel_log("ADD_USER", f"Failed adding {resolved_label} to {tid_str}: {last_err[:50]}")
 
         if idx < len(tids) - 1:
             jitter = random.uniform(0.0, 5.0)
@@ -2648,6 +2699,7 @@ def api_stop_all(x_panel_token: Optional[str] = Header(default=None), token: Opt
         w.data["auto_start"] = False
         threading.Thread(target=w.stop, daemon=True).start()
     save_ws_sessions_disk()
+    append_panel_log("SYS", "Stop-all executed")
     return {"ok": True}
 
 
@@ -2662,6 +2714,7 @@ def api_set_template(
         set_active_template(body.template, body.group_title_template)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    append_panel_log("TPL", "Updated message / group title templates")
     return {
         "ok": True,
         "template": get_active_single_line_template(),
@@ -2673,6 +2726,7 @@ def api_set_template(
 def api_reset_template(x_panel_token: Optional[str] = Header(default=None), token: Optional[str] = None):
     verify_auth(x_panel_token, token)
     reset_active_template()
+    append_panel_log("TPL", "Reset templates to defaults")
     return {
         "ok": True,
         "template": get_active_single_line_template(),
@@ -2777,6 +2831,23 @@ HTML_PAGE = """<!DOCTYPE html>
     .picker-box { display: flex; flex-direction: column; gap: 6px; max-height: 200px; overflow-y: auto; margin-top: 8px; }
     .pick-btn { width: 100%; text-align: left; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
     .tid-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.76rem; opacity: 0.85; word-break: break-all; }
+    .logs-box {
+      background: #090c12;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      height: 260px;
+      overflow-y: auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.78rem;
+      line-height: 1.45;
+      color: #cbd5e1;
+      white-space: pre-wrap;
+      word-break: break-word;
+      margin-top: 10px;
+    }
+    .log-line { padding: 2px 0; border-bottom: 1px solid rgba(39, 46, 63, 0.45); }
+    .log-line:last-child { border-bottom: 0; }
     .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.78rem; font-weight: 600; }
     .on { background: rgba(34,197,94,0.16); color: var(--green); }
     .off { background: rgba(239,68,68,0.16); color: var(--red); }
@@ -3061,12 +3132,12 @@ HTML_PAGE = """<!DOCTYPE html>
 
       <div class="card">
         <h2>8. Message & Group Rename Templates</h2>
-        <div class="muted">Enter <strong>one line</strong> using <code>{TARGET}</code>. Picks a random emoji for <code>-🌒-</code> on each of the 11 lines.</div>
+        <div class="muted">Enter <strong>one line</strong> using <code>{TARGET}</code>. Picks a random emoji formatted as <code>&lt;😎&gt;</code> on each of the 11 lines.</div>
         <label>Single Line Message Template</label>
-        <input id="templateLineInput" type="text" placeholder="<{TARGET}> Kɪ Mᴀᴀ Mᴏᴛɪ !< Gᴀɴᴅ Wᴀʟɪ> Rᴀɴᴅ!> -🌒-" />
+        <input id="templateLineInput" type="text" placeholder="<{TARGET}> Kɪ Mᴀᴀ Mᴏᴛɪ !< Gᴀɴᴅ Wᴀʟɪ> Rᴀɴᴅ!> <😎>" />
 
-        <label>Group Name Template (when NC is ON, uses <code>{TARGET}</code>)</label>
-        <input id="groupTitleInput" type="text" placeholder="{TARGET}" />
+        <label>Group Name Template (when NC is ON, uses <code>{TARGET}</code> + <code>&lt;⚡️&gt;</code>)</label>
+        <input id="groupTitleInput" type="text" placeholder="{TARGET} <⚡️>" />
 
         <div class="row">
           <button onclick="saveTemplate()">Save Templates</button>
@@ -3100,6 +3171,20 @@ HTML_PAGE = """<!DOCTYPE html>
       <div id="addMemberResult" class="link-box">
         <div class="muted">No member-add actions run yet.</div>
       </div>
+    </div>
+
+    <div class="card">
+      <div class="top" style="margin-bottom:4px;">
+        <div>
+          <h2 style="margin:0;">10. System & Activity Logs</h2>
+          <div class="muted" id="logsCountBar">Showing latest panel events and errors.</div>
+        </div>
+        <div class="row" style="margin:0;">
+          <button class="secondary" onclick="refreshState()">Refresh Logs</button>
+          <button class="danger" onclick="clearLogs()">Delete Logs</button>
+        </div>
+      </div>
+      <div id="panelLogsBox" class="logs-box">No logs recorded yet.</div>
     </div>
   </div>
 
@@ -3392,18 +3477,43 @@ HTML_PAGE = """<!DOCTYPE html>
           }).join("");
         }
 
+        const logsBox = document.getElementById("panelLogsBox");
+        const logsCountBar = document.getElementById("logsCountBar");
+        const logEntries = Array.isArray(data.logs) ? data.logs : [];
+        logsCountBar.textContent = `Showing ${logEntries.length} log entries.`;
+        if (!logEntries.length) {
+          logsBox.innerHTML = `<div class="muted">No logs recorded yet.</div>`;
+        } else {
+          const wasNearBottom = (logsBox.scrollHeight - logsBox.scrollTop - logsBox.clientHeight) < 36;
+          logsBox.innerHTML = logEntries.map(line => `<div class="log-line">${escapeHtml(line)}</div>`).join("");
+          if (wasNearBottom) {
+            logsBox.scrollTop = logsBox.scrollHeight;
+          }
+        }
+
         const tplEl = document.getElementById("templateLineInput");
         if (document.activeElement !== tplEl) {
           tplEl.value = data.template || "";
         }
         const gtEl = document.getElementById("groupTitleInput");
         if (document.activeElement !== gtEl) {
-          gtEl.value = data.group_title_template || "{TARGET}";
+          gtEl.value = data.group_title_template || "{TARGET} <⚡️>";
         }
       } catch (e) {
         document.getElementById("statsBar").textContent = e && e.name === "AbortError" ? "State request timed out" : e.message;
       } finally {
         isRefreshing = false;
+      }
+    }
+
+    async function clearLogs() {
+      try {
+        await api("/api/logs", "DELETE");
+        document.getElementById("panelLogsBox").innerHTML = `<div class="muted">No logs recorded yet.</div>`;
+        document.getElementById("logsCountBar").textContent = "Showing 0 log entries.";
+        showToast("Logs deleted");
+      } catch (e) {
+        showToast(e.message, true);
       }
     }
 
@@ -3731,7 +3841,7 @@ HTML_PAGE = """<!DOCTYPE html>
         const group_title_template = document.getElementById("groupTitleInput").value;
         const { data } = await api("/api/template", "POST", { template, group_title_template });
         document.getElementById("templateLineInput").value = data.template || template;
-        document.getElementById("groupTitleInput").value = data.group_title_template || "{TARGET}";
+        document.getElementById("groupTitleInput").value = data.group_title_template || "{TARGET} <⚡️>";
         showToast("Templates saved");
       } catch (e) { showToast(e.message, true); }
     }
@@ -3740,7 +3850,7 @@ HTML_PAGE = """<!DOCTYPE html>
       try {
         const { data } = await api("/api/template/reset", "POST");
         document.getElementById("templateLineInput").value = data.template || "";
-        document.getElementById("groupTitleInput").value = data.group_title_template || "{TARGET}";
+        document.getElementById("groupTitleInput").value = data.group_title_template || "{TARGET} <⚡️>";
         showToast("Templates reset to defaults");
       } catch (e) { showToast(e.message, true); }
     }
@@ -3767,7 +3877,7 @@ async def health_check():
 if __name__ == "__main__":
     backlog = 2048
     limit_concurrency = 256
-    print(f"🌐 Web panel listening on 0.0.0.0:{PORT} (DATA_DIR={DATA_DIR}, SOCKET_POOL={WS_SOCKET_POOL}, WS_RECYCLE={WS_WORKER_RECYCLE_SEC}s)", flush=True)
+    append_panel_log("SYS", f"Web panel listening on 0.0.0.0:{PORT} (DATA_DIR={DATA_DIR}, SOCKET_POOL={WS_SOCKET_POOL}, WS_RECYCLE={WS_WORKER_RECYCLE_SEC}s)")
     uvicorn.run(
         app,
         host="0.0.0.0",
