@@ -1501,42 +1501,77 @@ def next_delay(speed_mode: str) -> float:
     return random.uniform(50.0, 60.0)
 
 
-def apply_group_names_once(task_id: str, cl: Client, thread_ids: list[str], target_name: str):
-    title_tpl = get_active_group_title_template()
-    raw_title = title_tpl.replace("{TARGET}", target_name).strip()
-    if not raw_title:
-        return
-    new_title = format_nc_title(raw_title)
-    for idx, tid_str in enumerate(thread_ids):
-        if not is_task_running(task_id):
-            break
+def _rename_thread_by_session(session_id: str, ua: str, tid_str: str, nc_title: str) -> tuple[bool, str]:
+    """Renames a single thread using WS socket (with REST fallback)."""
+    if not nc_title:
+        return True, ""
+    err_msg = ""
+
+    if IGRAPIWEB_AVAILABLE and make_ig_web_socket is not None:
+        sock = None
         try:
-            cl.direct_thread_update_title(int(tid_str), new_title)
-            log_task(task_id, f"NC updated {tid_str} -> {new_title[:28]}")
+            sock = make_ig_web_socket(sessionid=session_id, user_agent=ua)
+            for mode in ("dgw", "iris"):
+                try:
+                    sock.connect(dm_receive=mode)
+                    break
+                except Exception:
+                    continue
+            _apply_sock_timeout(sock, 8.0)
+            sock.rename_group(str(tid_str), nc_title[:75])
+            return True, ""
         except Exception as exc:
-            log_task(task_id, f"NC skip/err {tid_str}: {str(exc)[:35]}")
-        if idx < len(thread_ids) - 1:
-            slept = 0.0
-            while slept < RENAME_PER_THREAD_GAP_SEC and is_task_running(task_id):
-                step = min(0.5, RENAME_PER_THREAD_GAP_SEC - slept)
-                time.sleep(step)
-                slept += step
+            err_msg = str(exc)[:60]
+        finally:
+            if sock is not None:
+                try:
+                    sock.disconnect()
+                except Exception:
+                    pass
+
+    try:
+        resp = requests.post(
+            f"https://www.instagram.com/api/v1/direct_v2/threads/{tid_str}/update_title/",
+            headers={
+                "User-Agent": ua,
+                "X-IG-App-ID": "936619743392459",
+                "Referer": f"https://www.instagram.com/direct/t/{tid_str}/",
+            },
+            cookies={"sessionid": session_id},
+            data={"title": nc_title[:75]},
+            timeout=10,
+        )
+        if resp.status_code in (200, 201):
+            return True, ""
+        err_msg = f"{err_msg}; HTTP {resp.status_code}".strip("; ")
+    except Exception as exc:
+        err_msg = f"{err_msg}; {str(exc)[:50]}".strip("; ")
+
+    return False, err_msg
 
 
-def group_rename_loop(task_id: str, cl: Client, thread_ids: list[str], target_name: str):
-    """Changes group name one by one every 10-20 minutes (600-1200s) without instant multi-thread burst."""
-    while is_task_running(task_id):
-        interval = random.uniform(600, 1200)
-        slept = 0.0
-        while slept < interval and is_task_running(task_id):
-            step = min(1.0, interval - slept)
-            time.sleep(step)
-            slept += step
-
-        if not is_task_running(task_id):
-            break
-
-        apply_group_names_once(task_id, cl, thread_ids, target_name)
+def _do_nc_after_send(
+    task_id: str,
+    cl: Optional[Client],
+    session_id: Optional[str],
+    ua: str,
+    tid_str: str,
+    nc_title: str,
+):
+    if not nc_title or not is_task_running(task_id):
+        return
+    if cl is not None:
+        try:
+            cl.direct_thread_update_title(int(tid_str), nc_title)
+            log_task(task_id, f"NC updated {tid_str} -> {nc_title[:28]}")
+        except Exception as exc:
+            log_task(task_id, f"NC err {tid_str}: {str(exc)[:40]}")
+    elif session_id:
+        ok, err = _rename_thread_by_session(session_id, ua, tid_str, nc_title)
+        if ok:
+            log_task(task_id, f"NC updated {tid_str} -> {nc_title[:28]}")
+        else:
+            log_task(task_id, f"NC err {tid_str}: {err[:40]}")
 
 
 def worker_loop(task_id: str):
@@ -1545,21 +1580,18 @@ def worker_loop(task_id: str):
         task = active_tasks.get(task_id)
         if not task:
             return
-        cl: Client = task["client"]
+        cl: Optional[Client] = task.get("client")
+        session_id: Optional[str] = task.get("session_id")
+        ua: str = task.get("ua") or random.choice(WS_UA_POOL)
         thread_ids = list(task["thread_ids"])
         target_name = task["target_name"]
         speed_mode = task.get("speed_mode", "slow")
         use_nc = bool(task.get("use_nc", True))
 
-    if use_nc:
-        renamer = threading.Thread(
-            target=group_rename_loop,
-            args=(task_id, cl, thread_ids, target_name),
-            daemon=True,
-        )
-        renamer.start()
-
     single_line_tpl = get_active_single_line_template()
+    title_tpl = get_active_group_title_template()
+    raw_nc = title_tpl.replace("{TARGET}", target_name).strip() or target_name.strip()
+    nc_title = format_nc_title(raw_nc) if (use_nc and raw_nc) else ""
     round_num = 0
 
     while is_task_running(task_id):
@@ -1584,20 +1616,37 @@ def worker_loop(task_id: str):
                     if not is_task_running(task_id):
                         break
                     try:
-                        cl.direct_send(payload, thread_ids=[int(tid_str)])
+                        if cl is not None:
+                            cl.direct_send(payload, thread_ids=[int(tid_str)])
+                            sent = True
+                        elif session_id:
+                            s_ok, _, s_err = _send_and_rename_ws_gc(
+                                session_id=session_id,
+                                ua=ua,
+                                tid_str=tid_str,
+                                text_body=payload,
+                                nc_title=None,
+                            )
+                            if not s_ok:
+                                raise RuntimeError(s_err or "send failed")
+                            sent = True
+                        else:
+                            raise RuntimeError("No sender client or session")
+
                         with tasks_lock:
                             GLOBAL_MESSAGES_SENT += 1
                             if task_id in active_tasks:
                                 active_tasks[task_id]["msg_count"] += 1
                         log_task(task_id, f"Sent to {tid_str}")
-                        sent = True
                         break
                     except Exception as exc:
                         wait = 30 * attempt
                         log_task(task_id, f"Retry {attempt}/{MAX_RETRIES} ({str(exc)[:35]}) in {wait}s")
                         time.sleep(wait)
 
-                if not sent and is_task_running(task_id):
+                if sent and use_nc and nc_title and is_task_running(task_id):
+                    _do_nc_after_send(task_id, cl, session_id, ua, tid_str, nc_title)
+                elif not sent and is_task_running(task_id):
                     log_task(task_id, f"Skipped thread {tid_str} after retries")
 
                 delay = next_delay(speed_mode)
@@ -1642,7 +1691,7 @@ def log_multi_gc(job_id: str, msg: str, sent_inc: int = 0, rename_inc: int = 0):
 
 
 def _send_and_rename_ws_gc(session_id: str, ua: str, tid_str: str, text_body: str, nc_title: Optional[str]) -> tuple[bool, bool, str]:
-    """Sends text and optionally renames GC using WS socket (with REST fallback for send)."""
+    """Sends text and optionally renames GC using WS socket (with REST fallback for send & rename)."""
     sent_ok = False
     renamed_ok = False
     err_msg = ""
@@ -1698,6 +1747,14 @@ def _send_and_rename_ws_gc(session_id: str, ua: str, tid_str: str, text_body: st
                 err_msg = f"HTTP {resp.status_code}"
         except Exception as exc:
             err_msg = str(exc)[:80]
+
+    if nc_title and not renamed_ok:
+        r_ok, r_err = _rename_thread_by_session(session_id, ua, tid_str, nc_title)
+        if r_ok:
+            renamed_ok = True
+            err_msg = ""
+        elif r_err:
+            err_msg = f"{err_msg}; nc:{r_err}".strip("; ")
 
     return sent_ok, renamed_ok, err_msg
 
@@ -2621,6 +2678,24 @@ def api_stop_task(
     return {"ok": True, "task_id": task_id}
 
 
+@app.delete("/api/tasks/{task_id}")
+def api_delete_task(
+    task_id: str,
+    x_panel_token: Optional[str] = Header(default=None),
+    token: Optional[str] = None,
+):
+    verify_auth(x_panel_token, token)
+    with tasks_lock:
+        task = active_tasks.get(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found.")
+        if task.get("running"):
+            raise HTTPException(status_code=400, detail="Stop the task before removing it.")
+        del active_tasks[task_id]
+    append_panel_log("TASK", f"Removed stopped task {task_id}")
+    return {"ok": True, "removed": task_id}
+
+
 @app.post("/api/multi-gc/start")
 def api_start_multi_gc(
     body: StartMultiGcReq,
@@ -2881,6 +2956,12 @@ HTML_PAGE = """<!DOCTYPE html>
         <button class="secondary" onclick="saveToken()">Save Token</button>
         <button class="danger" onclick="stopAll()">Stop All</button>
       </div>
+    </div>
+
+    <div class="card">
+      <h2>All Running Tasks</h2>
+      <div class="muted" id="allRunningSummary">Unified live view of all currently running tasks across all modules.</div>
+      <div id="allRunningTasksList" class="muted" style="margin-top:8px;">No running tasks right now.</div>
     </div>
 
     <div class="grid-2">
@@ -3331,6 +3412,73 @@ HTML_PAGE = """<!DOCTYPE html>
 
         const accs = Object.keys(data.accounts || {});
         const wsList = data.ws_sessions || [];
+        const mgcJobs = data.multi_gc_jobs || [];
+        const cJobs = data.group_creator_jobs || [];
+        const stdTasks = data.tasks || [];
+
+        const runningItems = [];
+        for (const t of stdTasks) {
+          if (t.running) {
+            runningItems.push({
+              kind: "Task",
+              id: t.task_id,
+              title: `${escapeHtml(t.username || "")} → <strong>${escapeHtml(t.target_name || "")}</strong>`,
+              meta: `Threads: ${(t.thread_ids || []).length} · Sent: ${t.msg_count || 0} · ${escapeHtml(t.last_event || "")} (${escapeHtml(t.last_update || "")})`,
+              stopHtml: `<button class="danger" onclick="stopTask('${escapeHtml(t.task_id)}')">Stop</button>`,
+            });
+          }
+        }
+        for (const j of mgcJobs) {
+          if (j.running) {
+            runningItems.push({
+              kind: "Multi-GC",
+              id: j.job_id,
+              title: `${escapeHtml(j.label || "")} · <strong>${escapeHtml(j.target_name || "")}</strong>`,
+              meta: `GCs: ${(j.thread_ids || []).length} · Sent: ${j.msg_count || 0} · NC: ${j.rename_count || 0} · ${escapeHtml(j.last_event || "")} (${escapeHtml(j.last_update || "")})`,
+              stopHtml: `<button class="danger" onclick="stopMultiGc('${escapeHtml(j.job_id)}')">Stop</button>`,
+            });
+          }
+        }
+        for (const j of cJobs) {
+          if (j.running) {
+            runningItems.push({
+              kind: "Creator",
+              id: j.job_id,
+              title: `@${escapeHtml(j.username || "")} · <strong>${j.created_count || 0}/${j.count || 0}</strong> created`,
+              meta: `${escapeHtml(j.last_event || "")} (${escapeHtml(j.last_update || "")})`,
+              stopHtml: `<button class="danger" onclick="stopGroupCreator('${escapeHtml(j.job_id)}')">Stop</button>`,
+            });
+          }
+        }
+        for (const w of wsList) {
+          const wst = w.stats || {};
+          if (wst.status === "live") {
+            runningItems.push({
+              kind: "WS",
+              id: w.session_name || w.uid,
+              title: `<strong>${escapeHtml(w.session_name || "")}</strong> · Thread <span class="tid-mono">${escapeHtml(w.thread_id || "")}</span>`,
+              meta: `Sockets: ${wst.sockets_live || 0}/${wst.sockets_total || 0} · Sent: ${wst.sent || 0} · Renames: ${wst.renames || 0}`,
+              stopHtml: `<button class="danger" onclick="wsAction('${escapeHtml(w.uid)}', 'stop')">Stop</button>`,
+            });
+          }
+        }
+
+        const runBox = document.getElementById("allRunningTasksList");
+        const runSummary = document.getElementById("allRunningSummary");
+        runSummary.textContent = `Currently running: ${runningItems.length} active item(s) across all sections.`;
+        if (!runningItems.length) {
+          runBox.innerHTML = `<div class="muted">No running tasks right now.</div>`;
+        } else {
+          runBox.innerHTML = runningItems.map(item => `
+            <div class="list-item">
+              <div>
+                <div><span class="badge on">RUNNING</span> <span class="badge speed-badge">${escapeHtml(item.kind)}</span> <strong>${escapeHtml(item.id)}</strong> · ${item.title}</div>
+                <div class="muted">${item.meta}</div>
+              </div>
+              ${item.stopHtml}
+            </div>
+          `).join("");
+        }
 
         const loginOptions = [];
         for (const w of wsList) {
@@ -3368,7 +3516,6 @@ HTML_PAGE = """<!DOCTYPE html>
         }
 
         const mgcBox = document.getElementById("multiGcJobsList");
-        const mgcJobs = data.multi_gc_jobs || [];
         if (!mgcJobs.length) {
           mgcBox.innerHTML = `<div class="muted">No Multi-GC sender jobs yet.</div>`;
         } else {
@@ -3388,10 +3535,10 @@ HTML_PAGE = """<!DOCTYPE html>
         }
 
         const tBox = document.getElementById("tasksList");
-        if (!data.tasks || !data.tasks.length) {
+        if (!stdTasks.length) {
           tBox.innerHTML = `<div class="muted">No tasks created yet.</div>`;
         } else {
-          tBox.innerHTML = data.tasks.map(t => `
+          tBox.innerHTML = stdTasks.map(t => `
             <div class="list-item">
               <div>
                 <div><strong>${escapeHtml(t.task_id)}</strong> · ${escapeHtml(t.username || "")} → <strong>${escapeHtml(t.target_name)}</strong>
@@ -3401,25 +3548,28 @@ HTML_PAGE = """<!DOCTYPE html>
                 </div>
                 <div class="muted">Sent: ${t.msg_count} · ${escapeHtml(t.last_event || "Idle")} (${escapeHtml(t.last_update || "")})</div>
               </div>
-              ${t.running ? `<button class="danger" onclick="stopTask('${escapeHtml(t.task_id)}')">Stop</button>` : ""}
+              <div class="row" style="margin:0;">
+                ${t.running
+                  ? `<button class="danger" onclick="stopTask('${escapeHtml(t.task_id)}')">Stop</button>`
+                  : `<button class="secondary" onclick="removeTask('${escapeHtml(t.task_id)}')">Remove</button>`}
+              </div>
             </div>
           `).join("");
         }
 
         const cBox = document.getElementById("creatorJobsList");
-        const jobs = data.group_creator_jobs || [];
-        if (!jobs.length) {
+        if (!cJobs.length) {
           cBox.innerHTML = `<div class="muted">No group creation jobs yet.</div>`;
         } else {
           const allIds = [];
-          for (const j of jobs) {
+          for (const j of cJobs) {
             for (const cid of (j.created_ids || [])) {
               if (!allIds.includes(String(cid))) allIds.push(String(cid));
             }
           }
           latestCreatedIds = allIds;
 
-          cBox.innerHTML = jobs.map(j => `
+          cBox.innerHTML = cJobs.map(j => `
             <div class="list-item">
               <div>
                 <div><strong>${escapeHtml(j.job_id)}</strong> · @${escapeHtml(j.username)} · <strong>${j.created_count}/${j.count}</strong> created
@@ -3823,6 +3973,14 @@ HTML_PAGE = """<!DOCTYPE html>
       try {
         await api(`/api/tasks/${encodeURIComponent(id)}/stop`, "POST");
         showToast(`Stopped ${id}`);
+        refreshState();
+      } catch (e) { showToast(e.message, true); }
+    }
+
+    async function removeTask(id) {
+      try {
+        await api(`/api/tasks/${encodeURIComponent(id)}`, "DELETE");
+        showToast(`Removed ${id}`);
         refreshState();
       } catch (e) { showToast(e.message, true); }
     }
