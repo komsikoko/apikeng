@@ -158,66 +158,7 @@ def verify_auth(x_panel_token: Optional[str] = None, token_query: Optional[str] 
         raise HTTPException(status_code=401, detail="Unauthorized: invalid or missing panel token")
 
 
-# ======================== SESSION ID & PERSISTENCE HELPERS ========================
-
-def clean_session_id(raw: str) -> str:
-    val = str(raw or "").strip().strip('"').strip("'")
-    if "sessionid=" in val:
-        val = val.split("sessionid=", 1)[1].split(";", 1)[0].strip()
-    return val
-
-
-def extract_client_session_id(client: Optional[Client]) -> str:
-    if client is None:
-        return ""
-    try:
-        sid = getattr(client, "sessionid", None)
-        if isinstance(sid, str) and sid.strip():
-            return clean_session_id(sid)
-    except Exception:
-        pass
-    try:
-        settings = client.get_settings() if hasattr(client, "get_settings") else {}
-        if isinstance(settings, dict):
-            auth_data = settings.get("authorization_data") or {}
-            if isinstance(auth_data, dict) and auth_data.get("sessionid"):
-                return clean_session_id(str(auth_data["sessionid"]))
-            cookies = settings.get("cookies") or {}
-            if isinstance(cookies, dict) and cookies.get("sessionid"):
-                return clean_session_id(str(cookies["sessionid"]))
-    except Exception:
-        pass
-    for sess_attr in ("private", "public"):
-        try:
-            sess = getattr(client, sess_attr, None)
-            jar = getattr(sess, "cookies", None)
-            if jar is not None:
-                val = jar.get("sessionid")
-                if val:
-                    return clean_session_id(str(val))
-        except Exception:
-            pass
-    return ""
-
-
-def _read_session_id_from_disk_file(username: str) -> str:
-    session_path = os.path.join(DATA_DIR, f"ig_{username}.json")
-    if not os.path.exists(session_path):
-        return ""
-    try:
-        with open(session_path, "r", encoding="utf-8") as f:
-            settings = json.load(f)
-        if isinstance(settings, dict):
-            auth_data = settings.get("authorization_data") or {}
-            if isinstance(auth_data, dict) and auth_data.get("sessionid"):
-                return clean_session_id(str(auth_data["sessionid"]))
-            cookies = settings.get("cookies") or {}
-            if isinstance(cookies, dict) and cookies.get("sessionid"):
-                return clean_session_id(str(cookies["sessionid"]))
-    except Exception:
-        pass
-    return ""
-
+# ======================== PERSISTENCE ========================
 
 def load_saved_accounts() -> dict:
     global _accounts_cache
@@ -238,12 +179,7 @@ def load_saved_accounts() -> dict:
         return dict(_accounts_cache)
 
 
-def register_saved_account(
-    username: str,
-    ig_user_id=None,
-    auth_method: str = "password",
-    session_id: Optional[str] = None,
-):
+def register_saved_account(username: str, ig_user_id=None, auth_method: str = "password"):
     global _accounts_cache
     with store_lock:
         accounts = {}
@@ -257,51 +193,15 @@ def register_saved_account(
                 accounts = {}
 
         prev = accounts.get(username, {})
-        resolved_sid = clean_session_id(session_id or "") or clean_session_id(prev.get("session_id", ""))
-        if not resolved_sid:
-            resolved_sid = _read_session_id_from_disk_file(username)
-
         accounts[username] = {
             "username": username,
             "ig_user_id": str(ig_user_id) if ig_user_id is not None else prev.get("ig_user_id"),
             "auth_method": auth_method,
-            "session_id": resolved_sid or None,
-            "has_session_id": bool(resolved_sid),
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
             json.dump(accounts, f, indent=2)
         _accounts_cache = dict(accounts)
-
-
-def get_account_session_id(username: str) -> str:
-    uname = (username or "").strip().lstrip("@")
-    if not uname:
-        return ""
-    cached_cl = client_cache.get(uname)
-    if cached_cl is not None:
-        sid = extract_client_session_id(cached_cl)
-        if sid:
-            return sid
-    accounts = load_saved_accounts()
-    rec = accounts.get(uname) or {}
-    sid = clean_session_id(rec.get("session_id", ""))
-    if sid:
-        return sid
-    sid = _read_session_id_from_disk_file(uname)
-    if sid:
-        register_saved_account(
-            uname,
-            ig_user_id=rec.get("ig_user_id"),
-            auth_method=rec.get("auth_method", "saved"),
-            session_id=sid,
-        )
-        return sid
-    try:
-        cl = get_or_resume_client(uname)
-        return extract_client_session_id(cl)
-    except Exception:
-        return ""
 
 
 def delete_saved_account(username: str):
@@ -480,6 +380,13 @@ def make_ig_client() -> Client:
     return cl
 
 
+def clean_session_id(raw: str) -> str:
+    val = raw.strip().strip('"').strip("'")
+    if "sessionid=" in val:
+        val = val.split("sessionid=", 1)[1].split(";", 1)[0].strip()
+    return val
+
+
 def resolve_username(client: Client, fallback: str = "") -> str:
     if fallback:
         return fallback.strip().lstrip("@")
@@ -495,16 +402,10 @@ def resolve_username(client: Client, fallback: str = "") -> str:
     return f"user_{getattr(client, 'user_id', 'session')}"
 
 
-def save_session(client: Client, username: str, auth_method: str, explicit_session_id: Optional[str] = None):
+def save_session(client: Client, username: str, auth_method: str):
     session_path = os.path.join(DATA_DIR, f"ig_{username}.json")
     client.dump_settings(session_path)
-    extracted_sid = clean_session_id(explicit_session_id or "") or extract_client_session_id(client)
-    register_saved_account(
-        username,
-        getattr(client, "user_id", None),
-        auth_method=auth_method,
-        session_id=extracted_sid,
-    )
+    register_saved_account(username, getattr(client, "user_id", None), auth_method=auth_method)
     client_cache[username] = client
 
 
@@ -518,11 +419,6 @@ def get_or_resume_client(username: str) -> Client:
     cl.load_settings(session_path)
     cl.account_info()
     cl.dump_settings(session_path)
-    sid = extract_client_session_id(cl)
-    if sid:
-        accounts = load_saved_accounts()
-        prev_method = (accounts.get(username) or {}).get("auth_method", "saved")
-        register_saved_account(username, getattr(cl, "user_id", None), auth_method=prev_method, session_id=sid)
     client_cache[username] = cl
     return cl
 
@@ -1655,7 +1551,7 @@ def worker_loop(task_id: str):
         speed_mode = task.get("speed_mode", "slow")
         use_nc = bool(task.get("use_nc", True))
 
-    if use_nc and cl is not None:
+    if use_nc:
         renamer = threading.Thread(
             target=group_rename_loop,
             args=(task_id, cl, thread_ids, target_name),
@@ -1688,8 +1584,6 @@ def worker_loop(task_id: str):
                     if not is_task_running(task_id):
                         break
                     try:
-                        if cl is None:
-                            raise RuntimeError("No instagrapi client bound to task")
                         cl.direct_send(payload, thread_ids=[int(tid_str)])
                         with tasks_lock:
                             GLOBAL_MESSAGES_SENT += 1
@@ -1963,8 +1857,7 @@ class InviteLinksReq(BaseModel):
 
 class WsAddReq(BaseModel):
     session_name: str
-    session_id: Optional[str] = ""
-    saved_username: Optional[str] = None
+    session_id: str
     gc_name_text: str
     msg_text: str
     thread_id: str
@@ -2005,8 +1898,7 @@ def _resolve_sender_auth(username: Optional[str], ws_uid: Optional[str], session
     uname = (username or "").strip().lstrip("@")
     if uname:
         cl = get_or_resume_client(uname)
-        sid = extract_client_session_id(cl) or get_account_session_id(uname)
-        return cl, sid or None, random.choice(WS_UA_POOL) if sid else None, f"@{uname}"
+        return cl, None, None, f"@{uname}"
 
     with ws_lock:
         first_w = next(iter(ws_sessions.values()), None)
@@ -2121,7 +2013,6 @@ async def api_state(x_panel_token: Optional[str] = Header(default=None), token: 
         ws_view.append({
             "uid": uid,
             "session_name": w.data.get("session_name", "Unnamed"),
-            "saved_username": w.data.get("saved_username"),
             "thread_id": w.data.get("thread_id", ""),
             "thread_ids": w.data.get("thread_ids", [w.data.get("thread_id", "")]),
             "gc_name_text": w.data.get("gc_name_text", ""),
@@ -2139,17 +2030,8 @@ async def api_state(x_panel_token: Optional[str] = Header(default=None), token: 
     with logs_lock:
         logs_snapshot = list(PANEL_LOGS)
 
-    raw_accounts = load_saved_accounts()
-    accounts_view = {}
-    for uname, meta in raw_accounts.items():
-        m_copy = dict(meta) if isinstance(meta, dict) else {}
-        sid_val = clean_session_id(m_copy.get("session_id", "")) or _read_session_id_from_disk_file(uname)
-        m_copy["has_session_id"] = bool(sid_val)
-        m_copy.pop("session_id", None)
-        accounts_view[uname] = m_copy
-
     return {
-        "accounts": accounts_view,
+        "accounts": load_saved_accounts(),
         "template": get_active_single_line_template(),
         "group_title_template": get_active_group_title_template(),
         "is_custom_template": os.path.exists(TEMPLATE_FILE),
@@ -2192,7 +2074,6 @@ def api_ws_list(x_panel_token: Optional[str] = Header(default=None), token: Opti
             {
                 "uid": uid,
                 "session_name": w.data.get("session_name"),
-                "saved_username": w.data.get("saved_username"),
                 "thread_id": w.data.get("thread_id"),
                 "thread_ids": w.data.get("thread_ids", [w.data.get("thread_id", "")]),
                 "gc_name_text": w.data.get("gc_name_text"),
@@ -2217,12 +2098,8 @@ def api_ws_add(
     token: Optional[str] = None,
 ):
     verify_auth(x_panel_token, token)
-    saved_uname = (body.saved_username or "").strip().lstrip("@")
-    sid = clean_session_id(body.session_id or "")
-    if not sid and saved_uname:
-        sid = get_account_session_id(saved_uname)
-    sname = body.session_name.strip() or (f"ws_{saved_uname}" if saved_uname else "")
-
+    sname = body.session_name.strip()
+    sid = clean_session_id(body.session_id)
     tids = parse_thread_ids(body.thread_ids or [])
     tid = body.thread_id.strip()
     if tid.isdigit() and tid not in tids:
@@ -2230,12 +2107,7 @@ def api_ws_add(
     gc_text = body.gc_name_text.strip()
     msg_text = body.msg_text.strip()
 
-    if not sid:
-        raise HTTPException(
-            status_code=400,
-            detail="Session ID is required (either select a saved account with a valid sessionid or paste a sessionid cookie).",
-        )
-    if not sname or not tids or not gc_text or not msg_text:
+    if not sname or not sid or not tids or not gc_text or not msg_text:
         raise HTTPException(status_code=400, detail="Session name, session ID, GC name text, message text, and at least 1 numeric thread ID are required.")
     if body.delay_min < 0.01 or body.delay_max < body.delay_min:
         raise HTTPException(status_code=400, detail="Invalid message delays (min >= 0.01, max >= min).")
@@ -2262,7 +2134,6 @@ def api_ws_add(
     rec = {
         "_uid": uid,
         "session_name": sname,
-        "saved_username": saved_uname or None,
         "session_id": sid,
         "gc_name_text": gc_text,
         "msg_text": msg_text,
@@ -2286,7 +2157,7 @@ def api_ws_add(
         threading.Thread(target=worker.start, daemon=True).start()
 
     save_ws_sessions_disk()
-    append_panel_log("WS", f"Added session '{sname}' ({uid}){f' from @{saved_uname}' if saved_uname else ''}")
+    append_panel_log("WS", f"Added session '{sname}' ({uid})")
     return {
         "ok": True,
         "uid": uid,
@@ -2307,11 +2178,6 @@ def api_ws_start(
         w = ws_sessions.get(uid)
     if not w:
         raise HTTPException(status_code=404, detail="WS session not found.")
-    saved_uname = w.data.get("saved_username")
-    if saved_uname:
-        refreshed_sid = get_account_session_id(saved_uname)
-        if refreshed_sid:
-            w.data["session_id"] = refreshed_sid
     w.data["auto_start"] = True
     threading.Thread(target=w.start, daemon=True).start()
     save_ws_sessions_disk()
@@ -2424,22 +2290,6 @@ def api_ws_delete(
 
 # ---------- Existing Instagrapi, Thread Fetcher & Group Endpoints ----------
 
-@app.get("/api/accounts/{username}/session-id")
-def api_get_account_session_id(
-    username: str,
-    x_panel_token: Optional[str] = Header(default=None),
-    token: Optional[str] = None,
-):
-    verify_auth(x_panel_token, token)
-    uname = username.strip().lstrip("@")
-    if not uname:
-        raise HTTPException(status_code=400, detail="Username is required.")
-    sid = get_account_session_id(uname)
-    if not sid:
-        raise HTTPException(status_code=404, detail=f"No stored sessionid found for @{uname}.")
-    return {"ok": True, "username": uname, "session_id": sid}
-
-
 @app.post("/api/login/session")
 def api_login_session(
     body: SessionLoginReq,
@@ -2460,9 +2310,9 @@ def api_login_session(
         if not getattr(cl, "user_id", None):
             raise RuntimeError("Could not verify Instagram user ID.")
         uname = resolve_username(cl)
-        save_session(cl, uname, "sessionid", explicit_session_id=cleaned)
-        append_panel_log("AUTH", f"Session login success for @{uname} (sessionid saved)")
-        return {"ok": True, "username": uname, "user_id": str(cl.user_id), "has_session_id": True}
+        save_session(cl, uname, "sessionid")
+        append_panel_log("AUTH", f"Session login success for @{uname}")
+        return {"ok": True, "username": uname, "user_id": str(cl.user_id)}
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {str(exc)[:180]}")
 
@@ -2485,16 +2335,14 @@ def api_login_password(
             cl.login(uname, body.password, verification_code=body.two_factor_code.strip())
             pending_2fa.pop(uname, None)
             save_session(cl, uname, "password+2fa")
-            sid_saved = bool(get_account_session_id(uname))
-            append_panel_log("AUTH", f"Password+2FA login success for @{uname} (sessionid={'saved' if sid_saved else 'none'})")
-            return {"ok": True, "username": uname, "user_id": str(cl.user_id), "has_session_id": sid_saved}
+            append_panel_log("AUTH", f"Password+2FA login success for @{uname}")
+            return {"ok": True, "username": uname, "user_id": str(cl.user_id)}
 
         cl = make_ig_client()
         cl.login(uname, body.password)
         save_session(cl, uname, "password")
-        sid_saved = bool(get_account_session_id(uname))
-        append_panel_log("AUTH", f"Password login success for @{uname} (sessionid={'saved' if sid_saved else 'none'})")
-        return {"ok": True, "username": uname, "user_id": str(cl.user_id), "has_session_id": sid_saved}
+        append_panel_log("AUTH", f"Password login success for @{uname}")
+        return {"ok": True, "username": uname, "user_id": str(cl.user_id)}
     except TwoFactorRequired:
         if cl is not None:
             pending_2fa[uname] = {"client": cl, "password": body.password}
@@ -3225,13 +3073,9 @@ HTML_PAGE = """<!DOCTYPE html>
 
       <div class="grid-2" style="margin-top:10px;">
         <div>
-          <label>Use Saved Account (Auto-fills Session ID)</label>
-          <select id="wsSavedAccountSelect" onchange="onWsSavedAccountChange(this.value)">
-            <option value="">-- Manual Session ID --</option>
-          </select>
           <label>Session Name</label>
           <input id="wsSessionName" placeholder="e.g. ws_acc_1" />
-          <label>Instagram Session ID (auto-filled when saved account selected)</label>
+          <label>Instagram Session ID</label>
           <input id="wsSessionId" type="password" placeholder="sessionid value" />
           <label>GC Name Text</label>
           <input id="wsGcName" placeholder="Group rename text" />
@@ -3420,7 +3264,7 @@ HTML_PAGE = """<!DOCTYPE html>
       return String(rawStr || "")
         .split(",")
         .map(s => s.trim())
-        .filter(s => /^\d+$/.test(s));
+        .filter(s => /^\\d+$/.test(s));
     }
 
     function getSelectedThreadStrings() {
@@ -3467,7 +3311,7 @@ HTML_PAGE = """<!DOCTYPE html>
     function selectAllLoaded(selectAll) {
       if (!loadedThreads.length) return showToast("Fetch GCs/chats first", true);
       document.getElementById("threadIdsInput").value = selectAll
-        ? loadedThreads.map(t => String(t.id).trim()).filter(s => /^\d+$/.test(s)).join(", ")
+        ? loadedThreads.map(t => String(t.id).trim()).filter(s => /^\\d+$/.test(s)).join(", ")
         : "";
       renderThreadPicker();
     }
@@ -3510,32 +3354,15 @@ HTML_PAGE = """<!DOCTYPE html>
           if (accs.includes(prev)) sel.value = prev;
         }
 
-        const wsAccSel = document.getElementById("wsSavedAccountSelect");
-        if (wsAccSel) {
-          const prevWsAcc = wsAccSel.value;
-          wsAccSel.innerHTML = `<option value="">-- Manual Session ID --</option>` + accs.map(u => {
-            const m = data.accounts[u] || {};
-            const tag = m.has_session_id ? "sessionid ready" : "no sessionid";
-            return `<option value="${escapeHtml(u)}">@${escapeHtml(u)} (${tag})</option>`;
-          }).join("");
-          if (prevWsAcc && accs.includes(prevWsAcc)) wsAccSel.value = prevWsAcc;
-        }
-
         const accBox = document.getElementById("accountsList");
         if (!accs.length) {
           accBox.innerHTML = `<div class="muted">No saved accounts yet.</div>`;
         } else {
           accBox.innerHTML = accs.map(u => {
             const m = data.accounts[u];
-            const sidBadge = m.has_session_id
-              ? `<span class="badge on" style="margin-left:6px;">sessionid saved</span>`
-              : `<span class="badge off" style="margin-left:6px;">no sessionid</span>`;
             return `<div class="list-item">
-              <div><strong>@${escapeHtml(u)}</strong> <span class="muted">(${escapeHtml(m.auth_method || "saved")})</span>${sidBadge}</div>
-              <div class="row" style="margin:0;">
-                ${m.has_session_id ? `<button class="secondary" onclick="useAccountInWs('${escapeHtml(u)}')">Use in WS</button>` : ""}
-                <button class="secondary" onclick="deleteAccount('${escapeHtml(u)}')">Remove</button>
-              </div>
+              <div><strong>@${escapeHtml(u)}</strong> <span class="muted">(${escapeHtml(m.auth_method || "saved")})</span></div>
+              <button class="secondary" onclick="deleteAccount('${escapeHtml(u)}')">Remove</button>
             </div>`;
           }).join("");
         }
@@ -3790,41 +3617,12 @@ HTML_PAGE = """<!DOCTYPE html>
       } catch (e) { showToast(e.message, true); }
     }
 
-    async function onWsSavedAccountChange(username) {
-      const uname = String(username || "").trim();
-      if (!uname) return;
-      const nameInp = document.getElementById("wsSessionName");
-      if (!nameInp.value.trim()) {
-        nameInp.value = `ws_${uname}`;
-      }
-      try {
-        const { data } = await api(`/api/accounts/${encodeURIComponent(uname)}/session-id`);
-        if (data.session_id) {
-          document.getElementById("wsSessionId").value = data.session_id;
-          showToast(`Loaded sessionid for @${uname}`);
-        }
-      } catch (e) {
-        showToast(e.message, true);
-      }
-    }
-
-    function useAccountInWs(username) {
-      const sel = document.getElementById("wsSavedAccountSelect");
-      if (sel) {
-        sel.value = username;
-        onWsSavedAccountChange(username);
-        sel.scrollIntoView({ behavior: "smooth", block: "center" });
-      }
-    }
-
     async function addWsSession() {
       try {
         const extraTids = parseThreadStringList(document.getElementById("wsThreadIds").value);
-        const saved_username = (document.getElementById("wsSavedAccountSelect")?.value || "").trim() || null;
         const payload = {
           session_name: document.getElementById("wsSessionName").value.trim(),
           session_id: document.getElementById("wsSessionId").value.trim(),
-          saved_username,
           gc_name_text: document.getElementById("wsGcName").value.trim(),
           msg_text: document.getElementById("wsMsgText").value.trim(),
           thread_id: document.getElementById("wsThreadId").value.trim(),
@@ -3839,7 +3637,7 @@ HTML_PAGE = """<!DOCTYPE html>
         const { data } = await api("/api/ws/sessions", "POST", payload);
         document.getElementById("wsSessionId").value = "";
         if (data.started) {
-          showToast(`WS session "${payload.session_name || saved_username}" starting`);
+          showToast(`WS session "${payload.session_name}" starting`);
         } else {
           showToast(`Saved as stopped: ${data.error || "check socket/session"}`, true);
         }
@@ -4014,7 +3812,7 @@ HTML_PAGE = """<!DOCTYPE html>
       const links = latestExtractedLinks.map(x => x.invite_link).filter(Boolean);
       if (!links.length) return showToast("No extracted invite links to copy", true);
       try {
-        await navigator.clipboard.writeText(links.join("\n"));
+        await navigator.clipboard.writeText(links.join("\\n"));
         showToast(`Copied ${links.length} invite link(s)`);
       } catch (_) {
         showToast("Clipboard blocked—copy directly from the list above", true);
