@@ -820,6 +820,12 @@ class WsSessionWorker:
         body = ("\n" * 5).join([line] * random.randint(12, 18))
         return f"{subtle_link}\n\n{body}{WS_FOOTER}"
 
+    def build_reply_message(self) -> str:
+        """Self-replies are one short line: no link, no padding, no footer."""
+        emoji = random.choice(WS_EMOJI_POOL)
+        text = " ".join(str(self.data["msg_text"]).split())
+        return f"{text} <{emoji}>"
+
     def build_gc_name(self) -> str:
         return format_nc_title(self.data["gc_name_text"])
 
@@ -1149,7 +1155,14 @@ class WsSessionWorker:
                         self.stats["sent"] += 1
                     with tasks_lock:
                         GLOBAL_MESSAGES_SENT += 1
-                    return True, _extract_ids(res)
+                    ids = _extract_ids(res)
+                    if not any(ids) and not getattr(self, "_warned_no_ids", False):
+                        self._warned_no_ids = True
+                        append_panel_log(
+                            f"WS:{self.data.get('session_name', '?')}",
+                            f"send OK but no message_id/item_id found; response: {str(res)[:300]}",
+                        )
+                    return True, ids
                 with self._stats_lock:
                     self.stats["failed"] += 1
                     tag = f"reply->{reply_to}: " if reply_to else ""
@@ -1174,7 +1187,7 @@ class WsSessionWorker:
     def _self_reply_loop(self):
         """Periodically reply to one of this worker's own sent messages, chaining replies."""
         while not self.stop_event.is_set():
-            lo = max(5.0, float(self.data.get("self_reply_min", 30.0)))
+            lo = max(0.5, float(self.data.get("self_reply_min", 30.0)))
             hi = max(lo, float(self.data.get("self_reply_max", 90.0)))
             if self.stop_event.wait(random.uniform(lo, hi)):
                 break
@@ -1182,9 +1195,11 @@ class WsSessionWorker:
                 continue
             with self._own_lock:
                 if not self._own_msg_ids:
+                    with self._stats_lock:
+                        self.stats["last_error"] = "self-reply: no message IDs captured from sends yet"
                     continue
                 target = random.choice(list(self._own_msg_ids))
-            ok, new_ids = self._send_pool(self.build_message(), reply_to=target)
+            ok, new_ids = self._send_pool(self.build_reply_message(), reply_to=target)
             if ok:
                 with self._stats_lock:
                     self.stats["self_replies"] = int(self.stats.get("self_replies", 0)) + 1
@@ -2260,6 +2275,9 @@ def api_ws_add(
     if body.rename_min < 1.0 or body.rename_max < body.rename_min:
         raise HTTPException(status_code=400, detail="Invalid rename delays (min >= 1.0, max >= min).")
 
+    if body.self_reply_enabled and (body.self_reply_min < 0.5 or body.self_reply_max < body.self_reply_min):
+        raise HTTPException(status_code=400, detail="Invalid self-reply delays (min >= 0.5, max >= min).")
+
     primary_tid = tids[0]
     pool_size = clamp_socket_pool(body.socket_pool if body.socket_pool is not None else WS_SOCKET_POOL)
 
@@ -3288,6 +3306,22 @@ HTML_PAGE = """<!DOCTYPE html>
               <input id="wsRenameMax" type="number" step="0.5" min="1" value="15" />
             </div>
           </div>
+          <div class="two-col-inline">
+            <div>
+              <label>Self-reply</label>
+              <select id="wsSelfReply">
+                <option value="false">Off</option>
+                <option value="true" selected>On (reply to own messages, single line)</option>
+              </select>
+            </div>
+            <div>
+              <label>Self-reply Min / Max Delay (s)</label>
+              <div class="two-col-inline">
+                <input id="wsSelfReplyMin" type="number" step="0.5" min="0.5" value="3" />
+                <input id="wsSelfReplyMax" type="number" step="0.5" min="0.5" value="8" />
+              </div>
+            </div>
+          </div>
           <div class="row">
             <button onclick="addWsSession()">Add & Start WS Session</button>
           </div>
@@ -3875,6 +3909,9 @@ HTML_PAGE = """<!DOCTYPE html>
           rename_min: parseFloat(document.getElementById("wsRenameMin").value) || 5.0,
           rename_max: parseFloat(document.getElementById("wsRenameMax").value) || 15.0,
           auto_start: true,
+          self_reply_enabled: document.getElementById("wsSelfReply").value === "true",
+          self_reply_min: parseFloat(document.getElementById("wsSelfReplyMin").value) || 3,
+          self_reply_max: parseFloat(document.getElementById("wsSelfReplyMax").value) || 8,
         };
         const { data } = await api("/api/ws/sessions", "POST", payload);
         document.getElementById("wsSessionId").value = "";
