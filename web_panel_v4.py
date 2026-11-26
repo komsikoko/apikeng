@@ -742,6 +742,50 @@ def _apply_sock_timeout(ws_obj, sec: float = 8.0):
         pass
 
 
+def _extract_ws_message_id(obj) -> Optional[str]:
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        for key in ("message_id", "item_id", "mid", "id"):
+            val = obj.get(key)
+            if val is not None and str(val).strip() and str(val).strip().lower() not in ("none", "null", "true", "false"):
+                return str(val).strip()
+        for val in obj.values():
+            found = _extract_ws_message_id(val)
+            if found:
+                return found
+    elif isinstance(obj, (list, tuple)):
+        for item in obj:
+            found = _extract_ws_message_id(item)
+            if found:
+                return found
+    elif isinstance(obj, str):
+        m = re.search(r'"(?:message_id|item_id|mid)"\s*:\s*"([^"]+)"', obj)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def _extract_ws_client_context(obj) -> Optional[str]:
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        for key in ("client_context", "offline_threading_id", "otid"):
+            val = obj.get(key)
+            if val is not None and str(val).strip():
+                return str(val).strip()
+        for val in obj.values():
+            found = _extract_ws_client_context(val)
+            if found:
+                return found
+    elif isinstance(obj, (list, tuple)):
+        for item in obj:
+            found = _extract_ws_client_context(item)
+            if found:
+                return found
+    return None
+
+
 class WsSessionWorker:
     def __init__(self, data: dict):
         self.data = data
@@ -765,6 +809,13 @@ class WsSessionWorker:
         self._inflight = 0
         self._inflight_lock = threading.Lock()
 
+        # Self-reply chain tracking (per thread_id)
+        self._reply_lock = threading.Lock()
+        self._last_sent_msg_id: dict[str, str] = {}
+        self._last_sent_ctx: dict[str, str] = {}
+        self._last_sent_text: dict[str, str] = {}
+        self._send_method_sig_cache: dict[int, set[str]] = {}
+
         if "ua" not in self.data or not self.data["ua"]:
             self.data["ua"] = random.choice(WS_UA_POOL)
 
@@ -775,6 +826,7 @@ class WsSessionWorker:
 
         self.stats = {
             "sent": 0,
+            "replies": 0,
             "failed": 0,
             "renames": 0,
             "recycles": 0,
@@ -783,6 +835,7 @@ class WsSessionWorker:
             "last_error": None,
             "session_status": None,
             "session_error": None,
+            "last_reply_id": None,
         }
         self._stats_lock = threading.Lock()
 
@@ -795,6 +848,14 @@ class WsSessionWorker:
 
     def build_gc_name(self) -> str:
         return format_nc_title(self.data["gc_name_text"])
+
+    def _get_ws_target_threads(self) -> list[str]:
+        raw_tids = self.data.get("thread_ids")
+        tids = parse_thread_ids(raw_tids) if isinstance(raw_tids, list) else []
+        primary = str(self.data.get("thread_id", "")).strip()
+        if primary.isdigit() and primary not in tids:
+            tids.insert(0, primary)
+        return tids
 
     def _make_factory_kwargs(self) -> dict:
         base = {"sessionid": self.data["session_id"], "user_agent": self.data["ua"]}
@@ -947,6 +1008,11 @@ class WsSessionWorker:
         with self._listen_lock:
             self.listen_threads = [t for t in self.listen_threads if t.is_alive()]
 
+        with self._reply_lock:
+            self._last_sent_msg_id.clear()
+            self._last_sent_ctx.clear()
+            self._last_sent_text.clear()
+
         self.stop_event = threading.Event()
         self._rr_idx = 0
 
@@ -965,15 +1031,18 @@ class WsSessionWorker:
                 "status": "live",
                 "start_time": time.time(),
                 "sent": 0,
+                "replies": 0,
                 "failed": 0,
                 "renames": 0,
                 "recycles": 0,
                 "last_error": None if ok == self.pool_size else f"only {ok}/{self.pool_size} sockets",
                 "session_status": None,
                 "session_error": None,
+                "last_reply_id": None,
             })
 
-        append_panel_log(f"WS:{self.data.get('session_name', '?')}", f"Live ({ok}/{self.pool_size} sockets)")
+        reply_tag = " [Self-Reply Chain: ON]" if self.data.get("self_reply", False) else ""
+        append_panel_log(f"WS:{self.data.get('session_name', '?')}", f"Live ({ok}/{self.pool_size} sockets){reply_tag}")
         self.msg_thread = threading.Thread(target=self._msg_loop, daemon=True)
         self.rename_thread = threading.Thread(target=self._rename_loop, daemon=True)
         self.rotate_thread = threading.Thread(target=self._ws_rotate_loop, daemon=True)
@@ -996,9 +1065,11 @@ class WsSessionWorker:
                 d_max = max(d_min, float(self.data.get("delay_max", 0.2)))
                 interval = random.uniform(d_min, d_max)
 
+                self_reply_on = bool(self.data.get("self_reply", False))
                 with self._pool_lock:
                     live = sum(1 for s in self.sockets if s is not None)
-                max_inflight = max(4, min(8, live * 2)) if live > 0 else 1
+                # Keep sequential order when self_reply is active so every message replies to the immediately preceding sent message
+                max_inflight = 1 if self_reply_on else (max(4, min(8, live * 2)) if live > 0 else 1)
 
                 now = time.monotonic()
                 max_debt = max(1.5, interval * 20)
@@ -1042,6 +1113,93 @@ class WsSessionWorker:
                     return True
         return False
 
+    def _fetch_latest_own_message_id(self, sock, tid_str: str) -> Optional[str]:
+        """Fallback lookup via socket or web inbox to grab the latest message_id if send_message response omitted it."""
+        for method_name in ("get_thread", "fetch_thread", "direct_thread", "get_messages"):
+            fn = getattr(sock, method_name, None)
+            if callable(fn):
+                try:
+                    res = fn(tid_str)
+                    mid = _extract_ws_message_id(res)
+                    if mid:
+                        return mid
+                except Exception:
+                    pass
+        try:
+            resp = requests.get(
+                f"https://www.instagram.com/api/v1/direct_v2/threads/{tid_str}/?limit=5",
+                headers={
+                    "User-Agent": self.data.get("ua") or random.choice(WS_UA_POOL),
+                    "X-IG-App-ID": "936619743392459",
+                    "Referer": f"https://www.instagram.com/direct/t/{tid_str}/",
+                },
+                cookies={"sessionid": self.data["session_id"]},
+                timeout=6,
+            )
+            if resp.status_code == 200:
+                payload = resp.json()
+                items = (payload.get("thread") or {}).get("items") or []
+                for it in items:
+                    if isinstance(it, dict):
+                        iid = it.get("item_id") or it.get("id")
+                        if iid:
+                            return str(iid).strip()
+        except Exception:
+            pass
+        return None
+
+    def _send_ws_payload(self, sock, tid_str: str, msg: str, reply_to_id: Optional[str], reply_to_ctx: Optional[str]):
+        """Sends message via igrapiweb socket, attaching reply metadata when self-reply chaining is active."""
+        if not reply_to_id and not reply_to_ctx:
+            return sock.send_message(tid_str, {"text": msg})
+
+        # Check supported keyword parameters on sock.send_message once per class
+        cls_id = id(type(sock))
+        params = self._send_method_sig_cache.get(cls_id)
+        if params is None:
+            try:
+                params = set(inspect.signature(sock.send_message).parameters.keys())
+            except Exception:
+                params = set()
+            self._send_method_sig_cache[cls_id] = params
+
+        # 1. If send_message accepts explicit reply keyword arguments
+        for kw_name in ("reply_to_message_id", "replied_to_item_id", "reply_message_id", "reply_to"):
+            if kw_name in params and reply_to_id:
+                try:
+                    return sock.send_message(tid_str, {"text": msg}, **{kw_name: reply_to_id})
+                except TypeError:
+                    pass
+
+        # 2. Check dedicated reply helper methods on igrapiweb socket if present
+        if reply_to_id:
+            for reply_method in ("reply_message", "send_reply", "reply_to_message"):
+                fn = getattr(sock, reply_method, None)
+                if callable(fn):
+                    try:
+                        return fn(tid_str, reply_to_id, {"text": msg})
+                    except TypeError:
+                        try:
+                            return fn(tid_str, msg, reply_to_id)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
+        # 3. Pass reply fields inside the payload dict (standard igrapiweb / Instagram MQTT/DGW message dict)
+        payload: dict = {"text": msg}
+        if reply_to_id:
+            payload["replied_to_item_id"] = reply_to_id
+            payload["reply_to_message_id"] = reply_to_id
+        if reply_to_ctx:
+            payload["replied_to_client_context"] = reply_to_ctx
+
+        try:
+            return sock.send_message(tid_str, payload)
+        except Exception:
+            # Fallback to plain text if socket rejects extra dict keys
+            return sock.send_message(tid_str, {"text": msg})
+
     def _fire_message_rr(self):
         global GLOBAL_MESSAGES_SENT
         try:
@@ -1062,6 +1220,19 @@ class WsSessionWorker:
                     self.stats["failed"] += 1
                 return
 
+            tids = self._get_ws_target_threads()
+            if not tids:
+                return
+            tid_str = tids[self._rr_idx % len(tids)] if len(tids) > 1 else tids[0]
+
+            self_reply_on = bool(self.data.get("self_reply", False))
+            reply_to_id = None
+            reply_to_ctx = None
+            if self_reply_on:
+                with self._reply_lock:
+                    reply_to_id = self._last_sent_msg_id.get(tid_str)
+                    reply_to_ctx = self._last_sent_ctx.get(tid_str)
+
             msg = self.build_message()
             for offset in range(n):
                 with self._pool_lock:
@@ -1076,11 +1247,40 @@ class WsSessionWorker:
                         sock = self.sockets[i] if i < len(self.sockets) else None
                     if sock is None:
                         continue
-                    res = sock.send_message(self.data["thread_id"], {"text": msg})
+
+                    if self_reply_on and not reply_to_id and not reply_to_ctx:
+                        # Seed chain if this isn't the very first message or if previous response hid message_id
+                        with self._stats_lock:
+                            already_sent = int(self.stats.get("sent", 0)) > 0
+                        if already_sent:
+                            fetched_mid = self._fetch_latest_own_message_id(sock, tid_str)
+                            if fetched_mid:
+                                reply_to_id = fetched_mid
+                                with self._reply_lock:
+                                    self._last_sent_msg_id[tid_str] = fetched_mid
+
+                    res = self._send_ws_payload(sock, tid_str, msg, reply_to_id, reply_to_ctx)
 
                     if self._is_ok(res):
+                        new_mid = _extract_ws_message_id(res)
+                        new_ctx = _extract_ws_client_context(res)
+                        if not new_mid and self_reply_on:
+                            new_mid = self._fetch_latest_own_message_id(sock, tid_str)
+
+                        with self._reply_lock:
+                            if new_mid:
+                                self._last_sent_msg_id[tid_str] = new_mid
+                            if new_ctx:
+                                self._last_sent_ctx[tid_str] = new_ctx
+                            self._last_sent_text[tid_str] = msg
+
+                        did_reply = bool(self_reply_on and (reply_to_id or reply_to_ctx))
                         with self._stats_lock:
                             self.stats["sent"] += 1
+                            if did_reply:
+                                self.stats["replies"] = int(self.stats.get("replies", 0)) + 1
+                            if new_mid:
+                                self.stats["last_reply_id"] = new_mid
                         with tasks_lock:
                             GLOBAL_MESSAGES_SENT += 1
                     else:
@@ -1216,13 +1416,7 @@ class WsSessionWorker:
             if self.stop_event.wait(random.uniform(r_min, r_max)):
                 break
 
-            raw_tids = self.data.get("thread_ids")
-            tids = parse_thread_ids(raw_tids) if isinstance(raw_tids, list) else []
-            if not tids:
-                single = str(self.data.get("thread_id", "")).strip()
-                if single.isdigit():
-                    tids = [single]
-
+            tids = self._get_ws_target_threads()
             new_name = self.build_gc_name()
             for idx, tid_str in enumerate(tids):
                 if self.stop_event.is_set():
@@ -1364,6 +1558,7 @@ class WsSessionWorker:
         s["sockets_live"] = live
         s["sockets_total"] = total
         s["socket_pool"] = self.pool_size
+        s["self_reply"] = bool(self.data.get("self_reply", False))
         return s
 
 
@@ -1924,6 +2119,7 @@ class WsAddReq(BaseModel):
     delay_max: float = 0.2
     rename_min: float = 5.0
     rename_max: float = 15.0
+    self_reply: Optional[bool] = False
     auto_start: Optional[bool] = True
 
 
@@ -1934,6 +2130,10 @@ class WsAdjustReq(BaseModel):
 
 class WsSocketsReq(BaseModel):
     socket_pool: int
+
+
+class WsSelfReplyReq(BaseModel):
+    self_reply: bool
 
 
 # ======================== AUTH / SESSION RESOLUTION ========================
@@ -2079,6 +2279,7 @@ async def api_state(x_panel_token: Optional[str] = Header(default=None), token: 
             "delay_max": w.data.get("delay_max", 0.2),
             "rename_min": w.data.get("rename_min", 5.0),
             "rename_max": w.data.get("rename_max", 15.0),
+            "self_reply": bool(w.data.get("self_reply", False)),
             "auto_start": bool(w.data.get("auto_start", False)),
             "device_id": str(w.data.get("device_id", ""))[:12],
             "stats": st,
@@ -2140,6 +2341,7 @@ def api_ws_list(x_panel_token: Optional[str] = Header(default=None), token: Opti
                 "delay_max": w.data.get("delay_max"),
                 "rename_min": w.data.get("rename_min"),
                 "rename_max": w.data.get("rename_max"),
+                "self_reply": bool(w.data.get("self_reply", False)),
                 "auto_start": bool(w.data.get("auto_start", False)),
                 "stats": w.get_stats(),
             }
@@ -2188,6 +2390,7 @@ def api_ws_add(
     uid = uuid.uuid4().hex[:12]
 
     should_start = bool(True if body.auto_start is None else body.auto_start)
+    self_reply = bool(body.self_reply)
     rec = {
         "_uid": uid,
         "session_name": sname,
@@ -2201,6 +2404,7 @@ def api_ws_add(
         "delay_max": float(body.delay_max),
         "rename_min": float(body.rename_min),
         "rename_max": float(body.rename_max),
+        "self_reply": self_reply,
         "ua": ua,
         "device_id": dev_id,
         "auto_start": should_start,
@@ -2214,7 +2418,7 @@ def api_ws_add(
         threading.Thread(target=worker.start, daemon=True).start()
 
     save_ws_sessions_disk()
-    append_panel_log("WS", f"Added session '{sname}' ({uid})")
+    append_panel_log("WS", f"Added session '{sname}' ({uid}) [self_reply={'ON' if self_reply else 'OFF'}]")
     return {
         "ok": True,
         "uid": uid,
@@ -2290,6 +2494,32 @@ def api_ws_sockets(
     applied = w.set_socket_pool_size(body.socket_pool)
     save_ws_sessions_disk()
     return {"ok": True, "uid": uid, "socket_pool": applied, "stats": w.get_stats()}
+
+
+@app.post("/api/ws/sessions/{uid}/self-reply")
+def api_ws_self_reply(
+    uid: str,
+    body: WsSelfReplyReq,
+    x_panel_token: Optional[str] = Header(default=None),
+    token: Optional[str] = None,
+):
+    verify_auth(x_panel_token, token)
+    with ws_lock:
+        w = ws_sessions.get(uid)
+    if not w:
+        raise HTTPException(status_code=404, detail="WS session not found.")
+    w.data["self_reply"] = bool(body.self_reply)
+    if not w.data["self_reply"]:
+        with w._reply_lock:
+            w._last_sent_msg_id.clear()
+            w._last_sent_ctx.clear()
+            w._last_sent_text.clear()
+    save_ws_sessions_disk()
+    append_panel_log(
+        f"WS:{w.data.get('session_name', uid)}",
+        f"Self-Reply Chain set to {'ON' if w.data['self_reply'] else 'OFF'}",
+    )
+    return {"ok": True, "uid": uid, "self_reply": w.data["self_reply"], "stats": w.get_stats()}
 
 
 @app.post("/api/ws/sessions/{uid}/adjust")
@@ -2928,6 +3158,7 @@ HTML_PAGE = """<!DOCTYPE html>
     .off { background: rgba(239,68,68,0.16); color: var(--red); }
     .speed-badge { background: rgba(59,130,246,0.16); color: #93c5fd; }
     .nc-badge { background: rgba(245,158,11,0.16); color: #fcd34d; }
+    .reply-badge { background: rgba(236,72,153,0.18); color: #f9a8d4; }
     .muted { color: var(--muted); font-size: 0.85rem; }
     .list-item { border-top: 1px solid var(--border); padding: 10px 0; display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
     .list-item:first-child { border-top: 0; }
@@ -3150,7 +3381,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
     <div class="card">
       <h2>6. WebSocket Multi-Sender (igrapiweb)</h2>
-      <div class="muted" id="wsMetaBar">Separate WebSocket worker engine (socket pool, live socket scaling, dgw/iris fallback, rotation, auto-recycle & health checks).</div>
+      <div class="muted" id="wsMetaBar">Separate WebSocket worker engine (socket pool, live socket scaling, self-reply chaining, dgw/iris fallback, rotation, auto-recycle & health checks).</div>
 
       <div class="grid-2" style="margin-top:10px;">
         <div>
@@ -3196,6 +3427,11 @@ HTML_PAGE = """<!DOCTYPE html>
               <input id="wsRenameMax" type="number" step="0.5" min="1" value="15" />
             </div>
           </div>
+          <label>Self-Reply Chain Mode (keeps replying to its own previous message)</label>
+          <select id="wsSelfReply">
+            <option value="true" selected>ON — Reply to own previous message (chain)</option>
+            <option value="false">OFF — Normal messages</option>
+          </select>
           <div class="row">
             <button onclick="addWsSession()">Add & Start WS Session</button>
           </div>
@@ -3408,7 +3644,7 @@ HTML_PAGE = """<!DOCTYPE html>
           `CPU ${s.cpu_percent}% · RAM ${s.ram_percent}% (${s.ram_used_gb}/${s.ram_total_gb} GB) · RSS ${s.rss_mb} MB · Sent ${data.global_messages_sent} · Uptime ${data.uptime}`;
 
         document.getElementById("wsMetaBar").textContent =
-          `igrapiweb: ${data.igrapiweb_available ? "Available" : "Not Installed"} · Default Pool Size: ${data.ws_socket_pool} · WS-only recycle active`;
+          `igrapiweb: ${data.igrapiweb_available ? "Available" : "Not Installed"} · Default Pool Size: ${data.ws_socket_pool} · Self-Reply Chain & WS-only recycle active`;
 
         const accs = Object.keys(data.accounts || {});
         const wsList = data.ws_sessions || [];
@@ -3456,8 +3692,8 @@ HTML_PAGE = """<!DOCTYPE html>
             runningItems.push({
               kind: "WS",
               id: w.session_name || w.uid,
-              title: `<strong>${escapeHtml(w.session_name || "")}</strong> · Thread <span class="tid-mono">${escapeHtml(w.thread_id || "")}</span>`,
-              meta: `Sockets: ${wst.sockets_live || 0}/${wst.sockets_total || 0} · Sent: ${wst.sent || 0} · Renames: ${wst.renames || 0}`,
+              title: `<strong>${escapeHtml(w.session_name || "")}</strong> · Thread <span class="tid-mono">${escapeHtml(w.thread_id || "")}</span>${w.self_reply ? ` <span class="badge reply-badge">↩️ CHAIN REPLY</span>` : ""}`,
+              meta: `Sockets: ${wst.sockets_live || 0}/${wst.sockets_total || 0} · Sent: ${wst.sent || 0} · Replies: ${wst.replies || 0} · Renames: ${wst.renames || 0}`,
               stopHtml: `<button class="danger" onclick="wsAction('${escapeHtml(w.uid)}', 'stop')">Stop</button>`,
             });
           }
@@ -3592,6 +3828,7 @@ HTML_PAGE = """<!DOCTYPE html>
           wsBox.innerHTML = wsList.map(w => {
             const st = w.stats || {};
             const live = st.status === "live";
+            const selfReplyOn = Boolean(w.self_reply);
             const sockInpId = `wsLiveSock_${w.uid}`;
             const activeSockEl = document.getElementById(sockInpId);
             const curSockVal = (activeSockEl && document.activeElement === activeSockEl)
@@ -3602,14 +3839,18 @@ HTML_PAGE = """<!DOCTYPE html>
                 <div><strong>${escapeHtml(w.session_name)}</strong> <span class="tid-mono">(${escapeHtml(w.uid)})</span> · Thread <span class="tid-mono">${escapeHtml(w.thread_id)}</span>
                   <span class="badge ${live ? "on" : "off"}">${escapeHtml((st.status || "stopped").toUpperCase())}</span>
                   <span class="badge speed-badge">🔌 ${st.sockets_live || 0}/${st.sockets_total || 0} (pool:${w.socket_pool || 1})</span>
+                  <span class="badge ${selfReplyOn ? "reply-badge" : "off"}">↩️ REPLY CHAIN: ${selfReplyOn ? "ON" : "OFF"}</span>
                   ${st.session_status ? `<span class="badge nc-badge">🩺 ${escapeHtml(st.session_status)}</span>` : ""}
                 </div>
-                <div class="muted">Sent: ${st.sent || 0} · Fail: ${st.failed || 0} · Renames: ${st.renames || 0} · Recycles: ${st.recycles || 0} · Delay: ${w.delay_min}-${w.delay_max}s · Ren: ${w.rename_min}-${w.rename_max}s</div>
+                <div class="muted">Sent: ${st.sent || 0} · Replies: ${st.replies || 0} · Fail: ${st.failed || 0} · Renames: ${st.renames || 0} · Recycles: ${st.recycles || 0} · Delay: ${w.delay_min}-${w.delay_max}s · Ren: ${w.rename_min}-${w.rename_max}s</div>
                 ${st.last_error ? `<div class="tid-mono" style="color:#fca5a5; margin-top:2px;">Err: ${escapeHtml(st.last_error)}</div>` : ""}
                 <div class="row" style="margin-top:6px;">
                   <span class="muted">Live Sockets (1–10):</span>
                   <input id="${escapeHtml(sockInpId)}" type="number" min="1" max="10" value="${curSockVal}" style="width:74px; padding:5px 8px;" />
                   <button class="secondary" onclick="wsSetSockets('${escapeHtml(w.uid)}')">Set Sockets</button>
+                  <button class="${selfReplyOn ? "picked" : "secondary"}" onclick="wsToggleSelfReply('${escapeHtml(w.uid)}', ${!selfReplyOn})">
+                    ${selfReplyOn ? "↩️ Self-Reply: ON" : "↩️ Self-Reply: OFF"}
+                  </button>
                 </div>
               </div>
               <div class="row" style="margin:0;">
@@ -3782,12 +4023,13 @@ HTML_PAGE = """<!DOCTYPE html>
           delay_max: parseFloat(document.getElementById("wsDelayMax").value) || 0.2,
           rename_min: parseFloat(document.getElementById("wsRenameMin").value) || 5.0,
           rename_max: parseFloat(document.getElementById("wsRenameMax").value) || 15.0,
+          self_reply: document.getElementById("wsSelfReply").value === "true",
           auto_start: true,
         };
         const { data } = await api("/api/ws/sessions", "POST", payload);
         document.getElementById("wsSessionId").value = "";
         if (data.started) {
-          showToast(`WS session "${payload.session_name}" starting`);
+          showToast(`WS session "${payload.session_name}" starting${payload.self_reply ? " (Self-Reply Chain ON)" : ""}`);
         } else {
           showToast(`Saved as stopped: ${data.error || "check socket/session"}`, true);
         }
@@ -3802,6 +4044,16 @@ HTML_PAGE = """<!DOCTYPE html>
         const socket_pool = Math.max(1, Math.min(10, rawVal));
         const { data } = await api(`/api/ws/sessions/${encodeURIComponent(uid)}/sockets`, "POST", { socket_pool });
         showToast(`${uid}: sockets set to ${data.socket_pool}`);
+        refreshState();
+      } catch (e) { showToast(e.message, true); }
+    }
+
+    async function wsToggleSelfReply(uid, enable) {
+      try {
+        const { data } = await api(`/api/ws/sessions/${encodeURIComponent(uid)}/self-reply`, "POST", {
+          self_reply: Boolean(enable),
+        });
+        showToast(`${uid}: Self-Reply Chain ${data.self_reply ? "ON" : "OFF"}`);
         refreshState();
       } catch (e) { showToast(e.message, true); }
     }
