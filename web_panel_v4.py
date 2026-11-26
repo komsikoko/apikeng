@@ -742,24 +742,27 @@ def _apply_sock_timeout(ws_obj, sec: float = 8.0):
         pass
 
 
-def _extract_message_id(res) -> Optional[str]:
-    """Find a message_id/item_id anywhere in a send response."""
+def _find_key(res, key: str) -> Optional[str]:
     if isinstance(res, dict):
-        for key in ("message_id", "item_id"):
-            val = res.get(key)
-            if val:
-                return str(val)
+        val = res.get(key)
+        if val:
+            return str(val)
         for v in res.values():
             if isinstance(v, (dict, list)):
-                found = _extract_message_id(v)
+                found = _find_key(v, key)
                 if found:
                     return found
     elif isinstance(res, list):
         for v in res:
-            found = _extract_message_id(v)
+            found = _find_key(v, key)
             if found:
                 return found
     return None
+
+
+def _extract_ids(res) -> tuple:
+    """Return (message_id, item_id) from a send response; either may be None."""
+    return _find_key(res, "message_id"), _find_key(res, "item_id")
 
 
 class WsSessionWorker:
@@ -1075,16 +1078,19 @@ class WsSessionWorker:
         try:
             if self.stop_event.is_set():
                 return
-            ok, mid = self._send_pool(self.build_message())
-            if ok and mid and self.data.get("self_reply_enabled"):
+            ok, ids = self._send_pool(self.build_message())
+            if ok and ids and any(ids) and self.data.get("self_reply_enabled"):
                 with self._own_lock:
-                    self._own_msg_ids.append(mid)
+                    self._own_msg_ids.append(ids)
         finally:
             with self._inflight_lock:
                 self._inflight -= 1
 
-    def _send_pool(self, text: str, reply_to_mid: Optional[str] = None) -> tuple[bool, Optional[str]]:
-        """Send text round-robin across the socket pool. Returns (ok, message_id)."""
+    def _send_pool(self, text: str, reply_to: Optional[tuple] = None) -> tuple[bool, Optional[tuple]]:
+        """Send text round-robin across the socket pool.
+
+        reply_to is (message_id, item_id) of the target; returns (ok, (message_id, item_id)).
+        """
         global GLOBAL_MESSAGES_SENT
         with self._pool_lock:
             n = len(self.sockets)
@@ -1114,16 +1120,27 @@ class WsSessionWorker:
                 if sock is None:
                     continue
 
-                if reply_to_mid:
-                    # igrapiweb reads quote replies from options["quoted"]:
-                    # key.id -> replied_to_item_id, message.message_id -> reply_to_message_id.
-                    quoted = {
-                        "key": {"id": str(reply_to_mid)},
-                        "message": {"message_id": str(reply_to_mid)},
-                    }
+                if reply_to:
+                    r_mid, r_item = reply_to
+                    quoted = {"key": {}, "message": {}}
+                    if r_item:
+                        quoted["key"]["id"] = str(r_item)
+                    if r_mid:
+                        quoted["message"]["message_id"] = str(r_mid)
                     res = sock.send_message(
                         self.data["thread_id"], {"text": text}, options={"quoted": quoted}
                     )
+                    if not self._is_ok(res):
+                        # Web (graphql) reply was rejected; retry once over the WebSocket transport.
+                        first_err = str(res)[:80]
+                        res = sock.send_message(
+                            self.data["thread_id"], {"text": text},
+                            options={"quoted": quoted, "transport": "ws"},
+                        )
+                        if not self._is_ok(res) and isinstance(res, dict) and res.get("transport") == "ws":
+                            res = {"ok": True, "transport": "ws", **res}
+                        elif not self._is_ok(res):
+                            res = {"ok": False, "error": f"graphql: {first_err} | ws: {str(res)[:60]}"}
                 else:
                     res = sock.send_message(self.data["thread_id"], {"text": text})
 
@@ -1132,10 +1149,10 @@ class WsSessionWorker:
                         self.stats["sent"] += 1
                     with tasks_lock:
                         GLOBAL_MESSAGES_SENT += 1
-                    return True, _extract_message_id(res)
+                    return True, _extract_ids(res)
                 with self._stats_lock:
                     self.stats["failed"] += 1
-                    tag = f"reply->{reply_to_mid}: " if reply_to_mid else ""
+                    tag = f"reply->{reply_to}: " if reply_to else ""
                     self.stats["last_error"] = (tag + str(res))[:140]
                 return False, None
             except Exception as exc:
@@ -1167,13 +1184,13 @@ class WsSessionWorker:
                 if not self._own_msg_ids:
                     continue
                 target = random.choice(list(self._own_msg_ids))
-            ok, new_mid = self._send_pool(self.build_message(), reply_to_mid=target)
+            ok, new_ids = self._send_pool(self.build_message(), reply_to=target)
             if ok:
                 with self._stats_lock:
                     self.stats["self_replies"] = int(self.stats.get("self_replies", 0)) + 1
-                if new_mid:
+                if new_ids and any(new_ids):
                     with self._own_lock:
-                        self._own_msg_ids.append(new_mid)
+                        self._own_msg_ids.append(new_ids)
 
     def _rotate_socket_at(self, idx: int):
         old = None
