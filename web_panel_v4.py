@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional
 
+# Embedded environment configuration (no external env vars required)
 os.environ["PANEL_TOKEN"] = "KENG"
 os.environ["DATA_DIR"] = "/data" if os.path.isdir("/data") else "./data"
 os.environ["SOCKET_POOL"] = "1"
@@ -41,6 +42,8 @@ try:
 except Exception:
     make_ig_web_socket = None
     IGRAPIWEB_AVAILABLE = False
+
+# ======================== CONFIG ========================
 
 PORT = 8080
 PANEL_TOKEN = "KENG"
@@ -76,6 +79,7 @@ WS_EMOJI_POOL = [
     "🛡️", "🎯", "🧨", "🚀",
 ]
 WS_GC_EMOJI = "⚡️"
+WS_FOOTER = "\n\n\n\nScript by - ρ 𝕣 ꪜ 𝕣 अब्बू ☽"
 
 WS_UA_POOL = [
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
@@ -97,6 +101,7 @@ WS_WORKER_RECYCLE_SEC = 3600
 
 MIN_SAFE_ADD_COOLDOWN = 20.0
 RENAME_PER_THREAD_GAP_SEC = 4.0
+
 WS_SOCKET_POOL = 1
 
 _MWS_PARAMS = set()
@@ -143,6 +148,8 @@ signal.signal(signal.SIGTERM, _handle_exit_signal)
 signal.signal(signal.SIGINT, _handle_exit_signal)
 
 
+# ======================== AUTH HELPER ========================
+
 def verify_auth(x_panel_token: Optional[str] = None, token_query: Optional[str] = None):
     if not PANEL_TOKEN:
         return
@@ -150,6 +157,8 @@ def verify_auth(x_panel_token: Optional[str] = None, token_query: Optional[str] 
     if provided != PANEL_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized: invalid or missing panel token")
 
+
+# ======================== PERSISTENCE ========================
 
 def load_saved_accounts() -> dict:
     global _accounts_cache
@@ -347,6 +356,8 @@ def make_subtle_z_link() -> str:
     suffix = uuid.uuid4().hex[:3]
     return f"https://z.in/{slug}{suffix}"
 
+
+# ======================== IG HELPERS ========================
 
 def make_ig_client() -> Client:
     cl = Client()
@@ -711,6 +722,8 @@ def _create_single_group(cl: Client, title: str, member_user_ids: list[int], sen
     return tid_str
 
 
+# ======================== WEBSOCKET MULTI-SENDER (igrapiweb) ========================
+
 def clamp_socket_pool(n: int) -> int:
     return max(1, min(10, int(n)))
 
@@ -729,141 +742,12 @@ def _apply_sock_timeout(ws_obj, sec: float = 8.0):
         pass
 
 
-def _extract_ws_own_reply_target(session_id: str, ua: str, tid_str: str, state: dict, refresh: bool = False) -> Optional[dict]:
-    """
-    Seeds own message target once per thread for WS session when missing or refresh=True,
-    avoiding per-message polling overhead.
-    """
-    if not refresh and tid_str in state and state[tid_str] and state[tid_str].get("id"):
-        return state[tid_str]
-
-    sid = clean_session_id(session_id)
-    if not sid:
-        return None
-
-    headers = {
-        "User-Agent": ua or random.choice(WS_UA_POOL),
-        "X-IG-App-ID": "936619743392459",
-        "Accept": "application/json, text/plain, */*",
-        "Referer": f"https://www.instagram.com/direct/t/{tid_str}/",
-    }
-    cookies = {"sessionid": sid}
-
-    try:
-        my_uid = ""
-        for part in sid.split("%3A"):
-            if part.isdigit():
-                my_uid = part
-                break
-        if not my_uid and ":" in sid:
-            first_part = sid.split(":", 1)[0]
-            if first_part.isdigit():
-                my_uid = first_part
-
-        resp = requests.get(
-            f"https://www.instagram.com/api/v1/direct_v2/threads/{tid_str}/?limit=15",
-            headers=headers,
-            cookies=cookies,
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            thread_obj = data.get("thread") if isinstance(data, dict) else None
-            items = thread_obj.get("items") if isinstance(thread_obj, dict) else []
-            if isinstance(items, list):
-                for it in items:
-                    if not isinstance(it, dict):
-                        continue
-                    mid = it.get("item_id") or it.get("id")
-                    if not mid:
-                        continue
-                    uid = str(it.get("user_id") or "")
-                    if not my_uid or uid == my_uid:
-                        ctx = it.get("client_context") or it.get("offline_threading_id")
-                        target = {
-                            "id": str(mid).strip(),
-                            "client_context": str(ctx).strip() if ctx else None,
-                        }
-                        state[tid_str] = target
-                        return target
-    except Exception:
-        pass
-    return None
-
-
-def _ws_send_single_line_reply(
-    session_id: str,
-    ua: str,
-    tid_str: str,
-    single_line_text: str,
-    reply_state: dict,
-    chain: bool = False,
-) -> tuple[bool, str]:
-    """
-    Sends a single-line reply targeting the user's own message without multi-line gaps or script footer.
-    """
-    sid = clean_session_id(session_id)
-    if not sid:
-        return False, "Missing session_id"
-
-    clean_line = re.sub(r"\s+", " ", str(single_line_text or "")).strip()
-    if not clean_line:
-        return False, "Empty single-line message"
-
-    target = _extract_ws_own_reply_target(sid, ua, tid_str, reply_state, refresh=False)
-    token = uuid.uuid4().hex[:19]
-
-    headers = {
-        "User-Agent": ua or random.choice(WS_UA_POOL),
-        "X-IG-App-ID": "936619743392459",
-        "Referer": f"https://www.instagram.com/direct/t/{tid_str}/",
-    }
-    cookies = {"sessionid": sid}
-    form_data = {
-        "action": "send_item",
-        "is_shh_mode": "0",
-        "send_attribution": "direct_thread",
-        "client_context": token,
-        "mutation_token": token,
-        "offline_threading_id": token,
-        "thread_ids": f"[{int(tid_str)}]",
-        "text": clean_line,
-    }
-    if target and target.get("id"):
-        form_data["replied_to_item_id"] = str(target["id"])
-        form_data["replied_to_action_source"] = "swipe"
-        if target.get("client_context"):
-            form_data["replied_to_client_context"] = str(target["client_context"])
-
-    try:
-        resp = requests.post(
-            "https://www.instagram.com/api/v1/direct_v2/threads/broadcast/text/",
-            headers=headers,
-            cookies=cookies,
-            data=form_data,
-            timeout=10,
-        )
-        if resp.status_code in (200, 201):
-            if chain:
-                try:
-                    rj = resp.json()
-                    new_id = None
-                    if isinstance(rj, dict):
-                        for k in ("item_id", "message_id", "id"):
-                            if rj.get(k):
-                                new_id = str(rj[k]).strip()
-                                break
-                        if not new_id and isinstance(rj.get("payload"), dict):
-                            p = rj["payload"]
-                            new_id = str(p.get("item_id") or p.get("id") or "").strip() or None
-                    if new_id:
-                        reply_state[tid_str] = {"id": new_id, "client_context": token}
-                except Exception:
-                    pass
-            return True, ""
-        return False, f"HTTP {resp.status_code}"
-    except Exception as exc:
-        return False, str(exc)[:80]
+def _build_ws_send_payload(text: str, reply_to_id: Optional[str] = None) -> dict:
+    payload = {"text": text}
+    rid = str(reply_to_id or "").strip()
+    if rid:
+        payload["reply_to_message_id"] = rid
+    return payload
 
 
 class WsSessionWorker:
@@ -888,7 +772,6 @@ class WsSessionWorker:
         self._rr_lock = threading.Lock()
         self._inflight = 0
         self._inflight_lock = threading.Lock()
-        self._reply_state: dict = {}
 
         if "ua" not in self.data or not self.data["ua"]:
             self.data["ua"] = random.choice(WS_UA_POOL)
@@ -912,9 +795,11 @@ class WsSessionWorker:
         self._stats_lock = threading.Lock()
 
     def build_message(self) -> str:
+        subtle_link = make_subtle_z_link()
         emoji = random.choice(WS_EMOJI_POOL)
-        base = re.sub(r"\s+", " ", str(self.data.get("msg_text") or "")).strip()
-        return f"{base} <{emoji}>".strip()
+        line = f"{self.data['msg_text']} <{emoji}>"
+        body = ("\n" * 5).join([line] * random.randint(12, 18))
+        return f"{subtle_link}\n\n{body}{WS_FOOTER}"
 
     def build_gc_name(self) -> str:
         return format_nc_title(self.data["gc_name_text"])
@@ -1186,6 +1071,8 @@ class WsSessionWorker:
                 return
 
             msg = self.build_message()
+            reply_id = self.data.get("ws_reply_to") or self.data.get("reply_to")
+            send_payload = _build_ws_send_payload(msg, reply_id)
             for offset in range(n):
                 with self._pool_lock:
                     if offset >= len(self.sockets):
@@ -1199,20 +1086,7 @@ class WsSessionWorker:
                         sock = self.sockets[i] if i < len(self.sockets) else None
                     if sock is None:
                         continue
-
-                    reply_self = bool(self.data.get("reply_to_self", True))
-                    if reply_self:
-                        r_ok, r_err = _ws_send_single_line_reply(
-                            session_id=self.data["session_id"],
-                            ua=self.data.get("ua", ""),
-                            tid_str=str(self.data["thread_id"]),
-                            single_line_text=msg,
-                            reply_state=self._reply_state,
-                            chain=bool(self.data.get("chain_replies", False)),
-                        )
-                        res = {"ok": r_ok, "error": r_err}
-                    else:
-                        res = sock.send_message(self.data["thread_id"], {"text": msg})
+                    res = sock.send_message(self.data["thread_id"], send_payload)
 
                     if self._is_ok(res):
                         with self._stats_lock:
@@ -1345,6 +1219,7 @@ class WsSessionWorker:
                     self.stats["session_error"] = str(exc)[:100]
 
     def _rename_loop(self):
+        """One-by-one group rename loop with spacing between threads and no instant multi-thread burst."""
         while not self.stop_event.is_set():
             r_min = max(1.0, float(self.data.get("rename_min", 5)))
             r_max = max(r_min, float(self.data.get("rename_max", 15)))
@@ -1502,6 +1377,8 @@ class WsSessionWorker:
         return s
 
 
+# ======================== GROUP CREATOR LOOP ========================
+
 def is_creator_running(job_id: str) -> bool:
     with tasks_lock:
         return bool(group_creator_jobs.get(job_id, {}).get("running", False))
@@ -1604,6 +1481,8 @@ def group_creator_loop(job_id: str):
     log_creator(job_id, f"Completed ({done_n}/{count} created)")
 
 
+# ======================== WORKER LOOP & MULTI-GC SENDER ========================
+
 def is_task_running(task_id: str) -> bool:
     with tasks_lock:
         return bool(active_tasks.get(task_id, {}).get("running", False))
@@ -1626,12 +1505,14 @@ def log_task(task_id: str, msg: str):
 
 
 def next_delay(speed_mode: str) -> float:
+    """Fast mode: 8-10 seconds. Slow mode: 50-60 seconds."""
     if speed_mode == "fast":
         return random.uniform(8.0, 10.0)
     return random.uniform(50.0, 60.0)
 
 
 def _rename_thread_by_session(session_id: str, ua: str, tid_str: str, nc_title: str) -> tuple[bool, str]:
+    """Renames a single thread using WS socket (with REST fallback)."""
     if not nc_title:
         return True, ""
     err_msg = ""
@@ -1819,7 +1700,15 @@ def log_multi_gc(job_id: str, msg: str, sent_inc: int = 0, rename_inc: int = 0):
     append_panel_log(f"MGC {job_id}", msg)
 
 
-def _send_and_rename_ws_gc(session_id: str, ua: str, tid_str: str, text_body: str, nc_title: Optional[str]) -> tuple[bool, bool, str]:
+def _send_and_rename_ws_gc(
+    session_id: str,
+    ua: str,
+    tid_str: str,
+    text_body: str,
+    nc_title: Optional[str],
+    reply_to_id: Optional[str] = None,
+) -> tuple[bool, bool, str]:
+    """Sends text and optionally renames GC using WS socket (with REST fallback for send & rename)."""
     sent_ok = False
     renamed_ok = False
     err_msg = ""
@@ -1835,7 +1724,7 @@ def _send_and_rename_ws_gc(session_id: str, ua: str, tid_str: str, text_body: st
                 except Exception:
                     continue
             _apply_sock_timeout(sock, 8.0)
-            res = sock.send_message(str(tid_str), {"text": text_body})
+            res = sock.send_message(str(tid_str), _build_ws_send_payload(text_body, reply_to_id))
             if isinstance(res, dict) and (res.get("ok") is True or "message_id" in str(res)):
                 sent_ok = True
             else:
@@ -1888,6 +1777,7 @@ def _send_and_rename_ws_gc(session_id: str, ua: str, tid_str: str, text_body: st
 
 
 def multi_gc_loop(job_id: str):
+    """Sends text to each GC, optionally changes that GC's name right after sending, then waits 8-10s (fast) or 50-60s (slow)."""
     with tasks_lock:
         job = multi_gc_jobs.get(job_id)
         if not job:
@@ -1917,7 +1807,7 @@ def multi_gc_loop(job_id: str):
             if custom_text:
                 link = make_subtle_z_link()
                 emoji = random.choice(WS_EMOJI_POOL)
-                payload = f"{link}\n\n{custom_text} <{emoji}>"
+                payload = f"{link}\n\n{custom_text} <{emoji}>{WS_FOOTER}"
             else:
                 expanded = build_expanded_message(single_line_tpl, target_name)
                 link = make_subtle_z_link()
@@ -1976,6 +1866,8 @@ def multi_gc_loop(job_id: str):
 
     log_multi_gc(job_id, "Stopped")
 
+
+# ======================== REQUEST SCHEMAS ========================
 
 class SessionLoginReq(BaseModel):
     session_id: str
@@ -2044,14 +1936,13 @@ class WsAddReq(BaseModel):
     msg_text: str
     thread_id: str
     thread_ids: Optional[list[str]] = None
+    reply_to_message_id: Optional[str] = None
     socket_pool: Optional[int] = None
     delay_min: float = 0.1
     delay_max: float = 0.2
     rename_min: float = 5.0
     rename_max: float = 15.0
     auto_start: Optional[bool] = True
-    reply_to_self: Optional[bool] = True
-    chain_replies: Optional[bool] = False
 
 
 class WsAdjustReq(BaseModel):
@@ -2063,7 +1954,10 @@ class WsSocketsReq(BaseModel):
     socket_pool: int
 
 
+# ======================== AUTH / SESSION RESOLUTION ========================
+
 def _resolve_sender_auth(username: Optional[str], ws_uid: Optional[str], session_id: Optional[str]):
+    """Returns (client_or_none, session_id_or_none, ua_or_none, label)."""
     raw_sid = clean_session_id(session_id or "")
     if raw_sid:
         return None, raw_sid, random.choice(WS_UA_POOL), "sessionid"
@@ -2089,6 +1983,8 @@ def _resolve_sender_auth(username: Optional[str], ws_uid: Optional[str], session
     raise RuntimeError("Select a WS login session, saved account, or enter a Session ID.")
 
 
+# ======================== LIFESPAN & APP ========================
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     saved_ws = load_ws_sessions_disk()
@@ -2106,6 +2002,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="IG Web Controller", lifespan=lifespan)
 
+
+# ======================== API ROUTES ========================
 
 @app.get("/api/state")
 async def api_state(x_panel_token: Optional[str] = Header(default=None), token: Optional[str] = None):
@@ -2200,8 +2098,6 @@ async def api_state(x_panel_token: Optional[str] = Header(default=None), token: 
             "rename_min": w.data.get("rename_min", 5.0),
             "rename_max": w.data.get("rename_max", 15.0),
             "auto_start": bool(w.data.get("auto_start", False)),
-            "reply_to_self": bool(w.data.get("reply_to_self", True)),
-            "chain_replies": bool(w.data.get("chain_replies", False)),
             "device_id": str(w.data.get("device_id", ""))[:12],
             "stats": st,
         })
@@ -2243,6 +2139,8 @@ def api_clear_logs(x_panel_token: Optional[str] = Header(default=None), token: O
     return {"ok": True}
 
 
+# ---------- WS Multi-Sender API Endpoints ----------
+
 @app.get("/api/ws/sessions")
 def api_ws_list(x_panel_token: Optional[str] = Header(default=None), token: Optional[str] = None):
     verify_auth(x_panel_token, token)
@@ -2261,8 +2159,6 @@ def api_ws_list(x_panel_token: Optional[str] = Header(default=None), token: Opti
                 "rename_min": w.data.get("rename_min"),
                 "rename_max": w.data.get("rename_max"),
                 "auto_start": bool(w.data.get("auto_start", False)),
-                "reply_to_self": bool(w.data.get("reply_to_self", True)),
-                "chain_replies": bool(w.data.get("chain_replies", False)),
                 "stats": w.get_stats(),
             }
             for uid, w in ws_sessions.items()
@@ -2310,6 +2206,7 @@ def api_ws_add(
     uid = uuid.uuid4().hex[:12]
 
     should_start = bool(True if body.auto_start is None else body.auto_start)
+    reply_id = (body.reply_to_message_id or "").strip() or None
     rec = {
         "_uid": uid,
         "session_name": sname,
@@ -2318,6 +2215,7 @@ def api_ws_add(
         "msg_text": msg_text,
         "thread_id": primary_tid,
         "thread_ids": tids,
+        "ws_reply_to": reply_id,
         "socket_pool": pool_size,
         "delay_min": float(body.delay_min),
         "delay_max": float(body.delay_max),
@@ -2326,8 +2224,6 @@ def api_ws_add(
         "ua": ua,
         "device_id": dev_id,
         "auto_start": should_start,
-        "reply_to_self": bool(True if body.reply_to_self is None else body.reply_to_self),
-        "chain_replies": bool(False if body.chain_replies is None else body.chain_replies),
     }
 
     worker = WsSessionWorker(rec)
@@ -2468,6 +2364,8 @@ def api_ws_delete(
     append_panel_log("WS", f"Deleted session {uid}")
     return {"ok": True, "deleted": uid}
 
+
+# ---------- Existing Instagrapi, Thread Fetcher & Group Endpoints ----------
 
 @app.post("/api/login/session")
 def api_login_session(
@@ -2931,12 +2829,14 @@ def api_reset_template(x_panel_token: Optional[str] = Header(default=None), toke
     }
 
 
+# ======================== WEB UI ========================
+
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>IG Web Controller</title>
+  <title>ρ 𝕣 ꪜ 𝕣 अब्बू ☽ · IG Web Controller</title>
   <style>
     :root {
       --bg: #0b0d14;
@@ -2952,6 +2852,55 @@ HTML_PAGE = """<!DOCTYPE html>
     * { box-sizing: border-box; font-family: system-ui, -apple-system, sans-serif; }
     body { margin: 0; background: var(--bg); color: var(--text); padding: 20px; }
     .wrap { max-width: 1120px; margin: 0 auto; display: grid; gap: 16px; }
+
+    @keyframes rgbShift {
+      0% { background-position: 0% 50%; }
+      50% { background-position: 100% 50%; }
+      100% { background-position: 0% 50%; }
+    }
+    @keyframes pulseGlow {
+      0%, 100% {
+        box-shadow: 0 0 22px rgba(236, 72, 153, 0.35), 0 0 42px rgba(59, 130, 246, 0.25);
+        transform: translateY(0px);
+      }
+      50% {
+        box-shadow: 0 0 30px rgba(34, 211, 238, 0.45), 0 0 54px rgba(168, 85, 247, 0.35);
+        transform: translateY(-1px);
+      }
+    }
+
+    .hero-banner {
+      position: relative;
+      border-radius: 16px;
+      padding: 2px;
+      background: linear-gradient(120deg, #ff2a85, #ff8a00, #ffd600, #00f5a0, #00d9f5, #8b5cf6, #ff2a85);
+      background-size: 300% 300%;
+      animation: rgbShift 6s ease infinite, pulseGlow 3.2s ease-in-out infinite;
+    }
+    .hero-banner-inner {
+      background: radial-gradient(circle at 20% 20%, rgba(236, 72, 153, 0.22), transparent 45%),
+                  radial-gradient(circle at 80% 30%, rgba(34, 211, 238, 0.22), transparent 45%),
+                  radial-gradient(circle at 50% 90%, rgba(168, 85, 247, 0.24), transparent 55%),
+                  #0e111b;
+      border-radius: 14px;
+      padding: 24px 20px;
+      text-align: center;
+    }
+    .hero-banner-text {
+      font-size: clamp(2rem, 5vw, 3.25rem);
+      font-weight: 900;
+      letter-spacing: 0.05em;
+      line-height: 1.2;
+      background: linear-gradient(90deg, #ff4ecd, #ffbe0b, #00f5d4, #4cc9f0, #c77dff, #ff4ecd);
+      background-size: 250% 250%;
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+      animation: rgbShift 5s linear infinite;
+      filter: drop-shadow(0 0 14px rgba(236, 72, 153, 0.35));
+      word-break: break-word;
+    }
+
     .top { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; }
     .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; }
     .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
@@ -3011,6 +2960,12 @@ HTML_PAGE = """<!DOCTYPE html>
 </head>
 <body>
   <div class="wrap">
+    <div class="hero-banner">
+      <div class="hero-banner-inner">
+        <div class="hero-banner-text">ρ 𝕣 ꪜ 𝕣 अब्बू ☽</div>
+      </div>
+    </div>
+
     <div class="top">
       <div>
         <h1>Instagram Automation Web Panel</h1>
@@ -3215,7 +3170,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
     <div class="card">
       <h2>6. WebSocket Multi-Sender (igrapiweb)</h2>
-      <div class="muted" id="wsMetaBar">Separate WebSocket worker engine (single-line self-reply mode, socket pool, live socket scaling, dgw/iris fallback, rotation, auto-recycle & health checks).</div>
+      <div class="muted" id="wsMetaBar">Separate WebSocket worker engine (socket pool, live socket scaling, dgw/iris fallback, rotation, auto-recycle & health checks).</div>
 
       <div class="grid-2" style="margin-top:10px;">
         <div>
@@ -3226,7 +3181,7 @@ HTML_PAGE = """<!DOCTYPE html>
           <label>GC Name Text</label>
           <input id="wsGcName" placeholder="Group rename text" />
           <label>Message Text</label>
-          <input id="wsMsgText" placeholder="Single-line message body text" />
+          <input id="wsMsgText" placeholder="Message body text" />
         </div>
         <div>
           <div class="two-col-inline">
@@ -3259,22 +3214,6 @@ HTML_PAGE = """<!DOCTYPE html>
             <div>
               <label>Rename Max Delay (s)</label>
               <input id="wsRenameMax" type="number" step="0.5" min="1" value="15" />
-            </div>
-          </div>
-          <div class="two-col-inline">
-            <div>
-              <label>Reply Target</label>
-              <select id="wsReplyToSelf">
-                <option value="true" selected>Reply to Own Message (Single-Line)</option>
-                <option value="false">Standard Socket Send</option>
-              </select>
-            </div>
-            <div>
-              <label>Reply Mode</label>
-              <select id="wsChainReplies">
-                <option value="false" selected>Single Fixed Own Message</option>
-                <option value="true">Chain Own Replies</option>
-              </select>
             </div>
           </div>
           <div class="row">
@@ -3426,7 +3365,7 @@ HTML_PAGE = """<!DOCTYPE html>
       return String(rawStr || "")
         .split(",")
         .map(s => s.trim())
-        .filter(s => /^\\d+$/.test(s));
+        .filter(s => /^\d+$/.test(s));
     }
 
     function getSelectedThreadStrings() {
@@ -3473,7 +3412,7 @@ HTML_PAGE = """<!DOCTYPE html>
     function selectAllLoaded(selectAll) {
       if (!loadedThreads.length) return showToast("Fetch GCs/chats first", true);
       document.getElementById("threadIdsInput").value = selectAll
-        ? loadedThreads.map(t => String(t.id).trim()).filter(s => /^\\d+$/.test(s)).join(", ")
+        ? loadedThreads.map(t => String(t.id).trim()).filter(s => /^\d+$/.test(s)).join(", ")
         : "";
       renderThreadPicker();
     }
@@ -3489,7 +3428,7 @@ HTML_PAGE = """<!DOCTYPE html>
           `CPU ${s.cpu_percent}% · RAM ${s.ram_percent}% (${s.ram_used_gb}/${s.ram_total_gb} GB) · RSS ${s.rss_mb} MB · Sent ${data.global_messages_sent} · Uptime ${data.uptime}`;
 
         document.getElementById("wsMetaBar").textContent =
-          `igrapiweb: ${data.igrapiweb_available ? "Available" : "Not Installed"} · Default Pool Size: ${data.ws_socket_pool} · Single-line self-reply active`;
+          `igrapiweb: ${data.igrapiweb_available ? "Available" : "Not Installed"} · Default Pool Size: ${data.ws_socket_pool} · WS-only recycle active`;
 
         const accs = Object.keys(data.accounts || {});
         const wsList = data.ws_sessions || [];
@@ -3683,7 +3622,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 <div><strong>${escapeHtml(w.session_name)}</strong> <span class="tid-mono">(${escapeHtml(w.uid)})</span> · Thread <span class="tid-mono">${escapeHtml(w.thread_id)}</span>
                   <span class="badge ${live ? "on" : "off"}">${escapeHtml((st.status || "stopped").toUpperCase())}</span>
                   <span class="badge speed-badge">🔌 ${st.sockets_live || 0}/${st.sockets_total || 0} (pool:${w.socket_pool || 1})</span>
-                  <span class="badge nc-badge">${w.reply_to_self !== false ? "SELF-REPLY" : "SOCK-SEND"}</span>
+                  ${st.session_status ? `<span class="badge nc-badge">🩺 ${escapeHtml(st.session_status)}</span>` : ""}
                 </div>
                 <div class="muted">Sent: ${st.sent || 0} · Fail: ${st.failed || 0} · Renames: ${st.renames || 0} · Recycles: ${st.recycles || 0} · Delay: ${w.delay_min}-${w.delay_max}s · Ren: ${w.rename_min}-${w.rename_max}s</div>
                 ${st.last_error ? `<div class="tid-mono" style="color:#fca5a5; margin-top:2px;">Err: ${escapeHtml(st.last_error)}</div>` : ""}
@@ -3863,8 +3802,6 @@ HTML_PAGE = """<!DOCTYPE html>
           delay_max: parseFloat(document.getElementById("wsDelayMax").value) || 0.2,
           rename_min: parseFloat(document.getElementById("wsRenameMin").value) || 5.0,
           rename_max: parseFloat(document.getElementById("wsRenameMax").value) || 15.0,
-          reply_to_self: document.getElementById("wsReplyToSelf").value === "true",
-          chain_replies: document.getElementById("wsChainReplies").value === "true",
           auto_start: true,
         };
         const { data } = await api("/api/ws/sessions", "POST", payload);
@@ -4045,7 +3982,7 @@ HTML_PAGE = """<!DOCTYPE html>
       const links = latestExtractedLinks.map(x => x.invite_link).filter(Boolean);
       if (!links.length) return showToast("No extracted invite links to copy", true);
       try {
-        await navigator.clipboard.writeText(links.join("\\n"));
+        await navigator.clipboard.writeText(links.join("\n"));
         showToast(`Copied ${links.length} invite link(s)`);
       } catch (_) {
         showToast("Clipboard blocked—copy directly from the list above", true);
